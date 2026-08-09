@@ -8,3 +8,5 @@
 4. **Deterministic Safe Optimizer**: The optimizer baseline must perform only deterministic, non-semantic transformations (fingerprint matching, provenance merging, tag deduplication). Never perform automatic LLM semantic rewriting in the core vault engine.
 5. **Atomic Filesystem Safety**: Always write via temporary files (`fsutil.WriteFileAtomic`) with restrictive permissions (`0600`/`0700`) and symlink escape guards.
 6. **Cross-Platform Compatibility**: All code must support macOS, Linux, and Windows without platform assumptions.
+7. **Strict Credential Operational Security**: Never print, log, echo, or embed authentication credentials, tokens, or credential store dumps in code, scripts, command lines, walkthrough logs, or commit messages. All authentication must use existing system tools or environment variables without revealing secret values.
+

@@ -8,3 +8,4 @@ We welcome contributions to AgentPort!
 2. **Code Hygiene**: Run `gofmt -s -w .` and `go vet ./...` before submitting PRs.
 3. **Tests Required**: Every security boundary, format parser, and adapter must include unit tests. Ensure `go test ./...` passes cleanly.
 4. **Security First**: Never bypass client-side encryption or secret scanner rules.
+5. **Strict Credential Protection**: Never print, log, or commit secret tokens, API keys, or credential store contents. All PRs containing credentials or token dumps will be rejected immediately.
