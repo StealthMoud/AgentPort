@@ -10,7 +10,7 @@ import (
 )
 
 type TokenBudget struct {
-	MaxTokens        int `json:"max_tokens"`
+	MaxTokens       int `json:"max_tokens"`
 	InstructionsCap int `json:"instructions_cap"`
 	PreferencesCap  int `json:"preferences_cap"`
 	MemoryCap       int `json:"memory_cap"`
@@ -18,7 +18,7 @@ type TokenBudget struct {
 
 func DefaultTokenBudget() *TokenBudget {
 	return &TokenBudget{
-		MaxTokens:        12000,
+		MaxTokens:       12000,
 		InstructionsCap: 4000,
 		PreferencesCap:  3000,
 		MemoryCap:       5000,
@@ -35,12 +35,12 @@ type CompileItem struct {
 }
 
 type CompileManifest struct {
-	TargetProvider    string         `json:"target_provider"`
-	StateRoot         string         `json:"state_root"`
-	Budget            *TokenBudget   `json:"budget"`
-	TotalTokensEst    int            `json:"total_tokens_est"`
-	Items             []*CompileItem `json:"items"`
-	CompiledContent   string         `json:"compiled_content"`
+	TargetProvider  string         `json:"target_provider"`
+	StateRoot       string         `json:"state_root"`
+	Budget          *TokenBudget   `json:"budget"`
+	TotalTokensEst  int            `json:"total_tokens_est"`
+	Items           []*CompileItem `json:"items"`
+	CompiledContent string         `json:"compiled_content"`
 }
 
 type ContextCompiler struct {

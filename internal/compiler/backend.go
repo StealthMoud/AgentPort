@@ -11,7 +11,7 @@ import (
 
 var (
 	ErrBackendUnavailable = errors.New("model backend unavailable")
-	ErrInvalidProposal   = errors.New("invalid proposal structure")
+	ErrInvalidProposal    = errors.New("invalid proposal structure")
 )
 
 type ProposalOperation string
@@ -68,10 +68,10 @@ type AnalysisResponse struct {
 }
 
 type Metrics struct {
-	AnalyzedCount    int `json:"analyzed_count"`
-	DuplicateProposals int `json:"duplicate_proposals"`
-	ConflictProposals  int `json:"conflict_proposals"`
-	StaleProposals     int `json:"stale_proposals"`
+	AnalyzedCount        int `json:"analyzed_count"`
+	DuplicateProposals   int `json:"duplicate_proposals"`
+	ConflictProposals    int `json:"conflict_proposals"`
+	StaleProposals       int `json:"stale_proposals"`
 	EstimatedTokenBefore int `json:"estimated_token_before"`
 	EstimatedTokenAfter  int `json:"estimated_token_after"`
 }
@@ -99,7 +99,7 @@ func (b *TestBackend) Health(ctx context.Context) error {
 
 func (b *TestBackend) Analyze(ctx context.Context, req *AnalysisRequest) (*AnalysisResponse, error) {
 	proposals := make([]*Proposal, 0)
-	
+
 	// Deterministic duplicate detection check across items with identical content
 	seenContent := make(map[string]*model.Artifact)
 	for _, art := range req.Artifacts {
