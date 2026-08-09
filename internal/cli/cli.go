@@ -16,6 +16,10 @@ import (
 	"github.com/StealthMoud/AgentPort/internal/config"
 	"github.com/StealthMoud/AgentPort/internal/crypt"
 	"github.com/StealthMoud/AgentPort/internal/gitstore"
+	"github.com/StealthMoud/AgentPort/internal/model"
+	"github.com/StealthMoud/AgentPort/internal/compiler"
+	contextpkg "github.com/StealthMoud/AgentPort/internal/context"
+	"github.com/StealthMoud/AgentPort/internal/governance"
 	"github.com/StealthMoud/AgentPort/internal/optimizer"
 	"github.com/StealthMoud/AgentPort/internal/snapshot"
 	"github.com/StealthMoud/AgentPort/internal/vault"
@@ -43,6 +47,8 @@ portable across machines, operating systems, and AI coding agents.`,
 	rootCmd.AddCommand(newImportCmd())
 	rootCmd.AddCommand(newOptimizeCmd())
 	rootCmd.AddCommand(newValidateCmd())
+	rootCmd.AddCommand(newCompileCmd())
+	rootCmd.AddCommand(newMemoryCmd())
 	rootCmd.AddCommand(newExportCmd())
 	rootCmd.AddCommand(newSnapshotCmd())
 	rootCmd.AddCommand(newRemoteCmd())
@@ -241,9 +247,10 @@ func newStatusCmd() *cobra.Command {
 
 func newProvidersCmd() *cobra.Command {
 	var jsonOutput bool
+	var capFlag bool
 	cmd := &cobra.Command{
 		Use:   "providers",
-		Short: "Detect installed AI coding agent providers",
+		Short: "Detect installed AI coding agent providers and their capabilities",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -251,8 +258,32 @@ func newProvidersCmd() *cobra.Command {
 			}
 
 			adapters := getAdapters()
-			results := make([]*adapter.DetectResult, 0)
 
+			if capFlag {
+				capMap := make(map[string]adapter.Capabilities)
+				for name, ad := range adapters {
+					capMap[name] = ad.Capabilities()
+				}
+				if jsonOutput {
+					data, _ := json.MarshalIndent(capMap, "", "  ")
+					fmt.Println(string(data))
+					return nil
+				}
+				fmt.Println("Provider Capabilities")
+				fmt.Println()
+				for name, caps := range capMap {
+					fmt.Printf("%s:\n", strings.Title(name))
+					fmt.Printf("  Instructions: %s\n", caps.Instructions)
+					fmt.Printf("  Memory:       %s\n", caps.Memory)
+					fmt.Printf("  Skills:       %s\n", caps.Skills)
+					fmt.Printf("  Agents:       %s\n", caps.Agents)
+					fmt.Printf("  MCP:          %s\n", caps.MCP)
+					fmt.Printf("  ProjectRules: %s\n\n", caps.ProjectRules)
+				}
+				return nil
+			}
+
+			results := make([]*adapter.DetectResult, 0)
 			for _, ad := range adapters {
 				det, err := ad.Detect(ctx)
 				if err == nil {
@@ -279,11 +310,13 @@ func newProvidersCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output providers list in JSON format")
+	cmd.Flags().BoolVar(&capFlag, "capabilities", false, "Display provider feature capability matrix")
 	return cmd
 }
 
 func newScanCmd() *cobra.Command {
 	var providerFlag string
+	var workspaceFlag string
 	cmd := &cobra.Command{
 		Use:   "scan",
 		Short: "Scan providers for safe portable artifacts (read-only)",
@@ -303,6 +336,9 @@ func newScanCmd() *cobra.Command {
 			}
 
 			fmt.Println("AgentPort Scan")
+			if workspaceFlag != "" {
+				fmt.Printf("Workspace: %s\n", workspaceFlag)
+			}
 			fmt.Println()
 
 			for name, ad := range adapters {
@@ -324,11 +360,13 @@ func newScanCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&providerFlag, "provider", "", "Scan specific provider (codex, claude, gemini)")
+	cmd.Flags().StringVar(&workspaceFlag, "workspace", "", "Target workspace path")
 	return cmd
 }
 
 func newImportCmd() *cobra.Command {
 	var providerFlag string
+	var workspaceFlag string
 	var allFlag bool
 	cmd := &cobra.Command{
 		Use:   "import",
@@ -367,6 +405,9 @@ func newImportCmd() *cobra.Command {
 				}
 
 				for _, art := range arts {
+					if workspaceFlag != "" && art.Scope == model.ScopeProject {
+						art.Metadata = map[string]string{"workspace": workspaceFlag}
+					}
 					if err := v.SaveArtifact(art); err == nil {
 						importedCount++
 					}
@@ -380,6 +421,7 @@ func newImportCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&providerFlag, "provider", "", "Import from specific provider")
+	cmd.Flags().StringVar(&workspaceFlag, "workspace", "", "Target workspace path")
 	cmd.Flags().BoolVar(&allFlag, "all", false, "Import from all detected providers")
 	return cmd
 }
@@ -790,6 +832,184 @@ func newKeyCmd() *cobra.Command {
 			}
 
 			fmt.Printf("Successfully imported identity key (Recipient: %s)\n", kp.Recipient.String())
+			return nil
+		},
+	})
+
+	return cmd
+}
+
+func newCompileCmd() *cobra.Command {
+	var providerFlag string
+	var budgetFlag int
+	var dryRunFlag bool
+	cmd := &cobra.Command{
+		Use:   "compile",
+		Short: "Compile canonical vault context for a target provider within a token budget",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			if providerFlag == "" {
+				return fmt.Errorf("--provider <name> flag is required")
+			}
+
+			adapters := getAdapters()
+			ad, exists := adapters[providerFlag]
+			if !exists {
+				return fmt.Errorf("unknown provider %s", providerFlag)
+			}
+
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			v, err := vault.LoadOpen(cfg)
+			if err != nil {
+				return err
+			}
+
+			b := contextpkg.DefaultTokenBudget()
+			if budgetFlag > 0 {
+				b.MaxTokens = budgetFlag
+			}
+
+			cc := contextpkg.NewContextCompiler(b)
+			manifest, err := cc.Compile(ctx, v, providerFlag, ad.Capabilities())
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("AgentPort Context Compiler (%s)\n\n", strings.Title(providerFlag))
+			fmt.Printf("State Root: %s\n", manifest.StateRoot)
+			fmt.Printf("Budget:     %d tokens\n", manifest.Budget.MaxTokens)
+			fmt.Printf("Estimated:  %d tokens\n\n", manifest.TotalTokensEst)
+
+			fmt.Println("Included Entities:")
+			for _, item := range manifest.Items {
+				if item.Included {
+					fmt.Printf("  ✓ [%s] %s (~%d tokens)\n", item.Kind, item.Title, item.EstTokenCost)
+				}
+			}
+
+			fmt.Println("\nExcluded Entities:")
+			excludedCount := 0
+			for _, item := range manifest.Items {
+				if !item.Included {
+					fmt.Printf("  ○ [%s] %s (%s)\n", item.Kind, item.Title, item.Reason)
+					excludedCount++
+				}
+			}
+			if excludedCount == 0 {
+				fmt.Println("  (none)")
+			}
+
+			if dryRunFlag {
+				fmt.Println("\n(Dry-run mode: compile manifest generated successfully)")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&providerFlag, "provider", "", "Target provider (codex, claude, gemini)")
+	cmd.Flags().IntVar(&budgetFlag, "budget", 12000, "Maximum token budget allocation")
+	cmd.Flags().BoolVar(&dryRunFlag, "dry-run", false, "Preview context compilation manifest")
+	return cmd
+}
+
+func newMemoryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "memory",
+		Short: "Manage and analyze atomic canonical memories",
+	}
+
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List canonical memories in vault",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			v, err := vault.LoadOpen(cfg)
+			if err != nil {
+				return err
+			}
+
+			artifacts := v.ListArtifacts()
+			fmt.Println("Canonical Memories")
+			fmt.Println()
+			for _, art := range artifacts {
+				if art.Kind == model.KindMemory || art.Kind == model.KindPreference {
+					fmt.Printf("ID: %s | Title: %s | Scope: %s\n", art.ID, art.Title, art.Scope)
+				}
+			}
+			return nil
+		},
+	})
+
+	cmd.AddCommand(&cobra.Command{
+		Use:   "analyze",
+		Short: "Run memory compiler semantic analysis and generate proposals",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			v, err := vault.LoadOpen(cfg)
+			if err != nil {
+				return err
+			}
+
+			mc := compiler.NewMemoryCompiler(compiler.NewTestBackend())
+			res, err := mc.Analyze(ctx, v, "")
+			if err != nil {
+				return err
+			}
+
+			fmt.Println("Memory Compiler Semantic Analysis")
+			fmt.Println()
+			fmt.Printf("Artifacts Analyzed: %d\n", res.Metrics.AnalyzedCount)
+			fmt.Printf("Proposals Generated: %d\n\n", len(res.Proposals))
+
+			for _, prop := range res.Proposals {
+				fmt.Printf("[%s] %s (Confidence: %.2f)\n", prop.Operation, prop.Rationale, prop.Confidence)
+				fmt.Printf("  Before: %s\n", prop.BeforeState)
+				fmt.Printf("  After:  %s\n\n", prop.ProposedState)
+			}
+			return nil
+		},
+	})
+
+	cmd.AddCommand(&cobra.Command{
+		Use:   "history",
+		Short: "View append-only audit event history",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			j := governance.NewJournal(cfg)
+			events, err := j.ListEvents()
+			if err != nil {
+				return err
+			}
+
+			fmt.Println("Audit Event History")
+			fmt.Println()
+			if len(events) == 0 {
+				fmt.Println("No audit events recorded.")
+				return nil
+			}
+			for _, evt := range events {
+				fmt.Printf("%s | %s | %s | %s\n", evt.Timestamp.Format("2006-01-02 15:04:05"), evt.Actor, evt.Operation, evt.TargetID)
+			}
 			return nil
 		},
 	})

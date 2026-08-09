@@ -26,6 +26,17 @@ func (c *CodexAdapter) Name() string {
 	return "codex"
 }
 
+func (c *CodexAdapter) Capabilities() adapter.Capabilities {
+	return adapter.Capabilities{
+		Instructions: adapter.SupportFull,
+		Memory:       adapter.SupportPartial,
+		Skills:       adapter.SupportFull,
+		Agents:       adapter.SupportFull,
+		MCP:          adapter.SupportPartial,
+		ProjectRules: adapter.SupportFull,
+	}
+}
+
 func (c *CodexAdapter) resolveRoot() (string, error) {
 	if c.customRoot != "" {
 		return c.customRoot, nil

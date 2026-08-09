@@ -26,6 +26,17 @@ func (c *ClaudeAdapter) Name() string {
 	return "claude"
 }
 
+func (c *ClaudeAdapter) Capabilities() adapter.Capabilities {
+	return adapter.Capabilities{
+		Instructions: adapter.SupportFull,
+		Memory:       adapter.SupportFull,
+		Skills:       adapter.SupportFull,
+		Agents:       adapter.SupportFull,
+		MCP:          adapter.SupportPartial,
+		ProjectRules: adapter.SupportFull,
+	}
+}
+
 func (c *ClaudeAdapter) resolveRoot() (string, error) {
 	if c.customRoot != "" {
 		return c.customRoot, nil

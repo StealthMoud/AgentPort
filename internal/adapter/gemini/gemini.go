@@ -26,6 +26,17 @@ func (g *GeminiAdapter) Name() string {
 	return "gemini"
 }
 
+func (g *GeminiAdapter) Capabilities() adapter.Capabilities {
+	return adapter.Capabilities{
+		Instructions: adapter.SupportFull,
+		Memory:       adapter.SupportFull,
+		Skills:       adapter.SupportPartial,
+		Agents:       adapter.SupportPartial,
+		MCP:          adapter.SupportPartial,
+		ProjectRules: adapter.SupportFull,
+	}
+}
+
 func (g *GeminiAdapter) resolveRoot() (string, error) {
 	if g.customRoot != "" {
 		return g.customRoot, nil

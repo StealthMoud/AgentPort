@@ -60,9 +60,29 @@ type ExportResult struct {
 	Errors         []string `json:"errors"`
 }
 
+type FeatureSupport string
+
+const (
+	SupportFull        FeatureSupport = "full"
+	SupportPartial     FeatureSupport = "partial"
+	SupportImportOnly  FeatureSupport = "import-only"
+	SupportExportOnly  FeatureSupport = "export-only"
+	SupportUnsupported FeatureSupport = "unsupported"
+)
+
+type Capabilities struct {
+	Instructions FeatureSupport `json:"instructions"`
+	Memory       FeatureSupport `json:"memory"`
+	Skills       FeatureSupport `json:"skills"`
+	Agents       FeatureSupport `json:"agents"`
+	MCP          FeatureSupport `json:"mcp"`
+	ProjectRules FeatureSupport `json:"project_rules"`
+}
+
 type Adapter interface {
 	Name() string
 	Detect(ctx context.Context) (*DetectResult, error)
+	Capabilities() Capabilities
 	Scan(ctx context.Context) (*ScanResult, error)
 	Import(ctx context.Context, machineID string) ([]*model.Artifact, error)
 	PlanExport(ctx context.Context, artifacts []*model.Artifact) (*ExportPlan, error)
