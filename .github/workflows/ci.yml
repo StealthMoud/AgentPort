@@ -24,9 +24,10 @@ jobs:
 
       - name: Verify Go Formatting
         run: |
-          if [ "$(gofmt -l . | wc -l)" -gt 0 ]; then
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
             echo "The following files need gofmt:"
-            gofmt -l .
+            echo "$files"
             exit 1
           fi
         shell: bash
