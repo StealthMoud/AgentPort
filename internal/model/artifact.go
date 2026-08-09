@@ -196,4 +196,3 @@ func (a *Artifact) Clone() *Artifact {
 
 	return &cp
 }
-

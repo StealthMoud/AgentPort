@@ -188,5 +188,3 @@ func TestVaultTransactionsCommitAndRollback(t *testing.T) {
 		t.Errorf("committed artifact should exist in vault")
 	}
 }
-
-
