@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Verify Go Formatting
+        run: |
+          if [ "$(gofmt -l . | wc -l)" -gt 0 ]; then
+            echo "The following files need gofmt:"
+            gofmt -l .
+            exit 1
+          fi
+        shell: bash
+
+      - name: Run Go Vet
+        run: go vet ./...
+
+      - name: Run Unit & Integration Tests
+        run: go test -v -race ./...
+        shell: bash
+
+      - name: Build AgentPort Executable
+        run: go build -o bin/agentport ./cmd/agentport
