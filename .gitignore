@@ -1,0 +1,23 @@
+# AgentPort gitignore
+
+# Build output
+bin/
+agentport
+agentport.exe
+
+# Local vaults & user data
+.agentport/
+*.age
+*.key
+*.pem
+.env
+
+# Go binaries & test data
+*.test
+*.out
+
+# OS & IDE junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
