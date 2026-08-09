@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentPortCanonicalArtifactV1",
+  "type": "object",
+  "required": [
+    "id",
+    "schema_version",
+    "kind",
+    "scope",
+    "title",
+    "content",
+    "content_type",
+    "lifecycle",
+    "sensitivity",
+    "created_at",
+    "updated_at",
+    "fingerprint",
+    "provenance"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^apa_[a-z_]+_[0-9a-f]{16}$"
+    },
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"]
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "instruction",
+        "memory",
+        "preference",
+        "skill",
+        "agent",
+        "project_context",
+        "tool_definition"
+      ]
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["global", "project"]
+    },
+    "title": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "content_type": {
+      "type": "string"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lifecycle": {
+      "type": "string",
+      "enum": ["persistent", "replaceable", "temporary", "historical"]
+    },
+    "sensitivity": {
+      "type": "string",
+      "enum": ["normal", "private", "secret"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "provenance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "provider",
+          "machine_id",
+          "source_path",
+          "imported_at",
+          "source_fingerprint"
+        ],
+        "properties": {
+          "provider": { "type": "string" },
+          "machine_id": { "type": "string" },
+          "source_path": { "type": "string" },
+          "imported_at": { "type": "string", "format": "date-time" },
+          "source_fingerprint": { "type": "string" }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  }
+}
