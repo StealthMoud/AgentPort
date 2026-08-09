@@ -40,4 +40,7 @@ jobs:
         shell: bash
 
       - name: Build AgentPort Executable
-        run: go build -v -o agentport-bin ./cmd/agentport
+        run: |
+          mkdir -p bin
+          go build -o bin/agentport ./cmd/agentport
+        shell: bash

@@ -2,8 +2,10 @@
 
 # Build output
 bin/
-agentport
-agentport.exe
+/agentport
+/agentport.exe
+agentport-bin
+agentport-bin.exe
 
 # Local vaults & user data
 .agentport/
