@@ -19,9 +19,10 @@ import (
 )
 
 var (
-	ErrVaultNotInitialized = errors.New("vault is not initialized (run 'agentport init' first)")
-	ErrArtifactNotFound    = errors.New("artifact not found in vault")
-	ErrVaultCorrupted      = errors.New("vault state corrupted")
+	ErrVaultNotInitialized  = errors.New("vault is not initialized (run 'agentport init' first)")
+	ErrArtifactNotFound     = errors.New("artifact not found in vault")
+	ErrVaultCorrupted       = errors.New("vault state corrupted")
+	ErrRecipientKeyMismatch = errors.New("key recipient does not match vault recipient")
 )
 
 type VaultMetadata struct {
@@ -103,6 +104,11 @@ func Initialize(cfg *config.Config) (*Vault, error) {
 		vaultMeta = &VaultMetadata{}
 		if err := json.Unmarshal(data, vaultMeta); err != nil {
 			return nil, fmt.Errorf("failed parsing vault metadata: %w", err)
+		}
+		if vaultMeta.Recipient != "" && kp.Recipient != nil {
+			if vaultMeta.Recipient != kp.Recipient.String() {
+				return nil, fmt.Errorf("%w: expected %s, got %s", ErrRecipientKeyMismatch, vaultMeta.Recipient, kp.Recipient.String())
+			}
 		}
 	}
 
@@ -233,29 +239,42 @@ func (v *Vault) SaveArtifact(art *model.Artifact) error {
 		return err
 	}
 
-	v.artifacts[art.ID] = art
+	v.artifacts[art.ID] = art.Clone()
 	return nil
 }
 
-// GetArtifact retrieves artifact by ID.
+// GetArtifact retrieves a deep copy of an artifact by ID.
 func (v *Vault) GetArtifact(id string) (*model.Artifact, bool) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
 	art, exists := v.artifacts[id]
-	return art, exists
+	if !exists {
+		return nil, false
+	}
+	return art.Clone(), true
 }
 
-// ListArtifacts returns slice of all current local artifacts.
+// GetArtifactCopy retrieves a deep copy of an artifact by ID.
+func (v *Vault) GetArtifactCopy(id string) (*model.Artifact, bool) {
+	return v.GetArtifact(id)
+}
+
+// ListArtifacts returns a slice of deep copies of all current local artifacts.
 func (v *Vault) ListArtifacts() []*model.Artifact {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
 	res := make([]*model.Artifact, 0, len(v.artifacts))
 	for _, art := range v.artifacts {
-		res = append(res, art)
+		res = append(res, art.Clone())
 	}
 	return res
+}
+
+// ListArtifactCopies returns a slice of deep copies of all current local artifacts.
+func (v *Vault) ListArtifactCopies() []*model.Artifact {
+	return v.ListArtifacts()
 }
 
 // DeleteArtifact deletes artifact by ID.

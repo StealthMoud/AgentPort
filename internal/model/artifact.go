@@ -162,3 +162,38 @@ func GenerateArtifactID(kind Kind, fingerprint string) string {
 	}
 	return fmt.Sprintf("apa_%s_%s", kind, fingerprint)
 }
+
+// Clone returns a deep copy of the Artifact.
+func (a *Artifact) Clone() *Artifact {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+
+	if a.Files != nil {
+		cp.Files = make(map[string]string, len(a.Files))
+		for k, v := range a.Files {
+			cp.Files[k] = v
+		}
+	}
+
+	if a.Tags != nil {
+		cp.Tags = make([]string, len(a.Tags))
+		copy(cp.Tags, a.Tags)
+	}
+
+	if a.Provenance != nil {
+		cp.Provenance = make([]Provenance, len(a.Provenance))
+		copy(cp.Provenance, a.Provenance)
+	}
+
+	if a.Metadata != nil {
+		cp.Metadata = make(map[string]string, len(a.Metadata))
+		for k, v := range a.Metadata {
+			cp.Metadata[k] = v
+		}
+	}
+
+	return &cp
+}
+

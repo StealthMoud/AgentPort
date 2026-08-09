@@ -39,7 +39,17 @@ type Manifest struct {
 	Objects       map[string]*ManifestObject `json:"objects"` // Keyed by artifact ID
 }
 
+const (
+	SyncStatusSuccess           = "success"
+	SyncStatusPartial           = "partial"
+	SyncStatusConflict          = "conflict"
+	SyncStatusRemoteUnavailable = "remote_unavailable"
+	SyncStatusPushFailed        = "push_failed"
+	SyncStatusValidationFailed  = "validation_failed"
+)
+
 type SyncResult struct {
+	Status                string   `json:"status"`
 	LocalAhead            bool     `json:"local_ahead"`
 	RemoteAhead           bool     `json:"remote_ahead"`
 	ObjectsEncryptedCount int      `json:"objects_encrypted_count"`
@@ -99,10 +109,11 @@ func (s *Store) SetRemote(ctx context.Context, url string) error {
 	return err
 }
 
-// GetRemote returns the configured "origin" remote URL.
+// GetRemote returns the configured "origin" remote URL without initializing a repo if missing.
 func (s *Store) GetRemote(ctx context.Context) (string, error) {
-	if err := s.EnsureRepo(ctx); err != nil {
-		return "", err
+	gitDir := filepath.Join(s.cfg.SyncRepoDir, ".git")
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		return "", nil
 	}
 	return s.execGit(ctx, "remote", "get-url", "origin")
 }
@@ -236,6 +247,7 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 	res.ObjectsEncryptedCount = changedCount
 
 	if dryRun {
+		res.Status = SyncStatusSuccess
 		res.Message = "Sync dry-run completed successfully"
 		return res, nil
 	}
@@ -263,10 +275,14 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 	if remoteURL != "" {
 		_, pushErr := s.execGit(ctx, "push", "origin", "HEAD:main")
 		if pushErr != nil {
+			res.Status = SyncStatusPushFailed
+			res.Message = fmt.Sprintf("git push to remote failed: %v", pushErr)
 			res.Warnings = append(res.Warnings, fmt.Sprintf("git push failed: %v", pushErr))
+			return res, fmt.Errorf("git push to remote failed: %w", pushErr)
 		}
 	}
 
+	res.Status = SyncStatusSuccess
 	res.Message = "Sync completed successfully"
 	return res, nil
 }

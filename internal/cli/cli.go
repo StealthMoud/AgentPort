@@ -19,9 +19,8 @@ import (
 	"github.com/StealthMoud/AgentPort/internal/optimizer"
 	"github.com/StealthMoud/AgentPort/internal/snapshot"
 	"github.com/StealthMoud/AgentPort/internal/vault"
+	"github.com/StealthMoud/AgentPort/internal/version"
 )
-
-const Version = "v0.1.0-alpha.1"
 
 // NewRootCmd initializes and constructs the main Cobra command tree.
 func NewRootCmd() *cobra.Command {
@@ -62,14 +61,21 @@ func getAdapters() map[string]adapter.Adapter {
 }
 
 func newVersionCmd() *cobra.Command {
-	return &cobra.Command{
+	var fullFlag bool
+	cmd := &cobra.Command{
 		Use:   "version",
 		Short: "Print AgentPort CLI version",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Printf("agentport %s\n", Version)
+			if fullFlag {
+				fmt.Println(version.Full())
+			} else {
+				fmt.Println(version.String())
+			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&fullFlag, "full", false, "Print detailed build and environment information")
+	return cmd
 }
 
 func newInitCmd() *cobra.Command {

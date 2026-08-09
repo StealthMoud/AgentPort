@@ -55,10 +55,13 @@ func (m *Manager) CreateSnapshot(v *vault.Vault, reason string) (*SnapshotMetada
 	}
 
 	artifacts := v.ListArtifacts()
-	var totalFingerprints string
+	sort.Slice(artifacts, func(i, j int) bool {
+		return artifacts[i].ID < artifacts[j].ID
+	})
 
+	var totalFingerprints string
 	for _, art := range artifacts {
-		totalFingerprints += art.Fingerprint
+		totalFingerprints += art.ID + ":" + art.Fingerprint + "|"
 		data, err := json.MarshalIndent(art, "", "  ")
 		if err != nil {
 			return nil, err
@@ -128,7 +131,7 @@ func (m *Manager) ListSnapshots() ([]*SnapshotMetadata, error) {
 	return res, nil
 }
 
-// RestoreSnapshot restores vault artifacts state from a snapshot.
+// RestoreSnapshot restores vault artifacts state from a snapshot using transactional staging.
 func (m *Manager) RestoreSnapshot(v *vault.Vault, snapshotID string) error {
 	snapDir := filepath.Join(m.cfg.SnapshotsDir, snapshotID)
 	artifactsDir := filepath.Join(snapDir, "artifacts")
@@ -137,36 +140,54 @@ func (m *Manager) RestoreSnapshot(v *vault.Vault, snapshotID string) error {
 		return ErrSnapshotNotFound
 	}
 
-	// 1. Create safety backup snapshot before restoring
-	_, _ = m.CreateSnapshot(v, "Pre-restore safety backup")
-
-	// 2. Clear current local vault artifacts
-	currentArtifacts := v.ListArtifacts()
-	for _, art := range currentArtifacts {
-		_ = v.DeleteArtifact(art.ID)
-	}
-
-	// 3. Copy snapshot artifacts into vault
+	// 1. Read and validate all snapshot artifacts into memory first
 	entries, err := os.ReadDir(artifactsDir)
 	if err != nil {
 		return err
 	}
 
+	stagedArtifacts := make([]*model.Artifact, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(artifactsDir, entry.Name()))
 		if err != nil {
-			return err
+			return fmt.Errorf("failed reading snapshot artifact %s: %w", entry.Name(), err)
 		}
 		art := &model.Artifact{}
 		if err := json.Unmarshal(data, art); err != nil {
+			return fmt.Errorf("failed parsing snapshot artifact %s: %w", entry.Name(), err)
+		}
+		if err := art.Validate(); err != nil {
+			return fmt.Errorf("snapshot artifact %s validation failed: %w", entry.Name(), err)
+		}
+		stagedArtifacts = append(stagedArtifacts, art)
+	}
+
+	// 2. Create safety backup snapshot before applying restoration
+	_, _ = m.CreateSnapshot(v, "Pre-restore safety backup")
+
+	// 3. Perform atomic transaction restore
+	tx := v.BeginTx()
+	currentArtifacts := v.ListArtifacts()
+	for _, art := range currentArtifacts {
+		if err := tx.DeleteArtifact(art.ID); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
-		if err := v.SaveArtifact(art); err != nil {
+	}
+
+	for _, art := range stagedArtifacts {
+		if err := tx.SaveArtifact(art); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("failed committing snapshot restore transaction: %w", err)
 	}
 
 	return nil
