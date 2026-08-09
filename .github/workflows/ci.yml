@@ -20,7 +20,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.x'
+          go-version-file: 'go.mod'
 
       - name: Verify Go Formatting
         run: |
@@ -40,4 +40,4 @@ jobs:
         shell: bash
 
       - name: Build AgentPort Executable
-        run: go build ./cmd/agentport
+        run: go build -v -o agentport-bin ./cmd/agentport
