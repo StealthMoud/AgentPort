@@ -39,13 +39,14 @@ type MachineMetadata struct {
 }
 
 type Vault struct {
-	mu        sync.RWMutex
-	cfg       *config.Config
-	Metadata  *VaultMetadata
-	Machine   *MachineMetadata
-	Key       *crypt.KeyPair
-	artifacts map[string]*model.Artifact
-	entities  map[string]*model.EnvelopeV2
+	mu          sync.RWMutex
+	cfg         *config.Config
+	Metadata    *VaultMetadata
+	Machine     *MachineMetadata
+	Key         *crypt.KeyPair
+	artifacts   map[string]*model.Artifact
+	entities    map[string]*model.EnvelopeV2
+	conflicted  map[string]bool
 }
 
 // GenerateID generates a random hex identifier with a prefix (e.g. apv_... or apm_...).
@@ -180,6 +181,7 @@ func (v *Vault) LoadAll() error {
 
 	v.artifacts = make(map[string]*model.Artifact)
 	v.entities = make(map[string]*model.EnvelopeV2)
+	v.conflicted = make(map[string]bool)
 
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -476,4 +478,28 @@ func (v *Vault) DeleteArtifact(id string) error {
 	_ = fsutil.WriteFileAtomic(filepath.Join(tombDir, id+".json"), data, 0600)
 
 	return nil
+}
+
+// MarkEntityConflicted records whether an entity has an unresolved application-level sync conflict.
+func (v *Vault) MarkEntityConflicted(id string, isConflicted bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.conflicted == nil {
+		v.conflicted = make(map[string]bool)
+	}
+	if isConflicted {
+		v.conflicted[id] = true
+	} else {
+		delete(v.conflicted, id)
+	}
+}
+
+// IsEntityConflicted returns true if entity ID has an unresolved application-level sync conflict.
+func (v *Vault) IsEntityConflicted(id string) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.conflicted == nil {
+		return false
+	}
+	return v.conflicted[id]
 }

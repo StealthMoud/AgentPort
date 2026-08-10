@@ -106,6 +106,10 @@ func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope mod
 		if art.Sensitivity == model.SensitivityPrivate && isRemoteBackend && !mc.allowPrivateRemote {
 			continue
 		}
+		// Unresolved sync conflicts MUST NOT enter compiled context
+		if v.IsEntityConflicted(art.ID) {
+			continue
+		}
 		if scope != "" && art.Scope != scope {
 			continue
 		}
@@ -124,6 +128,10 @@ func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope mod
 		}
 		// SensitivityPrivate requires explicit opt-in for remote backends
 		if env.Sensitivity == model.SensitivityPrivate && isRemoteBackend && !mc.allowPrivateRemote {
+			continue
+		}
+		// Unresolved sync conflicts MUST NOT enter compiled context
+		if v.IsEntityConflicted(env.ID) {
 			continue
 		}
 		if scope != "" && env.Scope != scope {
