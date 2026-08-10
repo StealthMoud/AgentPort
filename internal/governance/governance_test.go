@@ -646,3 +646,131 @@ func TestGovernanceRecoveryFailureIsExplicit(t *testing.T) {
 		t.Errorf("expected error message to contain snapshot ID and failed stage, got: %s", errStr)
 	}
 }
+
+func TestGovernanceProposalDeleteRecoveryFailureIsExplicit(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	// Create proposal 1 (not existing on disk prior to apply)
+	p1 := &compiler.Proposal{
+		ID:            "prop_del_rec_fail_1",
+		Operation:     compiler.OpCreate,
+		ProposedState: "Memory 1",
+		Status:        compiler.ProposalStatusPending,
+	}
+
+	// Create proposal 2 whose SaveProposal will fail (triggering rollback)
+	p2 := &compiler.Proposal{
+		ID:            "prop_del_rec_fail_2",
+		Operation:     compiler.OpCreate,
+		ProposedState: "Memory 2",
+		Status:        compiler.ProposalStatusPending,
+	}
+
+	// Make p2 proposal path a directory so SaveProposal(p2) fails
+	p2Path := filepath.Join(vaultDir, "proposals", p2.ID+".json")
+	_ = os.MkdirAll(p2Path, 0700)
+
+	// Make p1 proposal path a directory containing a file so that DeleteProposal(p1) during rollback fails!
+	p1Path := filepath.Join(vaultDir, "proposals", p1.ID+".json")
+	_ = os.MkdirAll(filepath.Join(p1Path, "subfolder"), 0700)
+
+	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{p1, p2})
+	if err == nil {
+		t.Fatalf("expected ApplyProposals to fail")
+	}
+
+	if !errors.Is(err, governance.ErrGovernanceRecoveryFailed) {
+		t.Fatalf("expected error to wrap ErrGovernanceRecoveryFailed when proposal deletion recovery fails, got: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "delete proposal") {
+		t.Errorf("expected error message to detail failed proposal deletion operation, got: %v", err)
+	}
+
+	// Cleanup directory blocks so test TempDir remove succeeds
+	_ = os.RemoveAll(filepath.Join(vaultDir, "proposals"))
+}
+
+func TestGovernanceAuditCleanupFailureIsExplicit(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	p1 := &compiler.Proposal{
+		ID:            "prop_audit_rec_fail_1",
+		Operation:     compiler.OpCreate,
+		ProposedState: "Memory 1 for audit rec test",
+		Status:        compiler.ProposalStatusPending,
+	}
+	p2 := &compiler.Proposal{
+		ID:            "prop_audit_rec_fail_2",
+		Operation:     compiler.OpCreate,
+		ProposedState: "Memory 2 for audit rec test",
+		Status:        compiler.ProposalStatusPending,
+	}
+
+	// p2 proposal file path is a directory -> SaveProposal(p2) will fail after p1 audit event is recorded
+	p2Path := filepath.Join(vaultDir, "proposals", p2.ID+".json")
+	_ = os.MkdirAll(p2Path, 0700)
+
+	// Watch for audit event file created by p1 and replace it with a non-empty directory so os.Remove(auditFile) fails!
+	auditDir := filepath.Join(vaultDir, "audit")
+	_ = os.MkdirAll(auditDir, 0700)
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				entries, err := os.ReadDir(auditDir)
+				if err == nil {
+					for _, entry := range entries {
+						if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+							// Audit file recorded! Convert to non-empty dir so os.Remove fails during rollback.
+							filePath := filepath.Join(auditDir, entry.Name())
+							_ = os.Remove(filePath)
+							_ = os.MkdirAll(filepath.Join(filePath, "subfolder"), 0700)
+							return
+						}
+					}
+				}
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{p1, p2})
+	close(done)
+
+	if err == nil {
+		t.Fatalf("expected ApplyProposals to fail")
+	}
+
+	if !errors.Is(err, governance.ErrGovernanceRecoveryFailed) {
+		t.Fatalf("expected error to wrap ErrGovernanceRecoveryFailed when audit cleanup fails, got: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "remove audit record") {
+		t.Errorf("expected error message to detail failed audit removal operation, got: %v", err)
+	}
+
+	// Cleanup directory blocks so test TempDir remove succeeds
+	_ = os.RemoveAll(auditDir)
+	_ = os.RemoveAll(filepath.Join(vaultDir, "proposals"))
+}

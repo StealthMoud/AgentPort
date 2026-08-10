@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/StealthMoud/AgentPort/internal/compiler"
@@ -249,13 +250,17 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 					recoveryErrs = append(recoveryErrs, fmt.Sprintf("restore proposal %s failed: %v", prop.ID, err))
 				}
 			} else {
-				_ = ps.DeleteProposal(prop.ID)
+				if err := ps.DeleteProposal(prop.ID); err != nil && !os.IsNotExist(err) {
+					recoveryErrs = append(recoveryErrs, fmt.Sprintf("delete proposal %s failed: %v", prop.ID, err))
+				}
 			}
 		}
 
 		// 3. Remove partial audit records created during this operation
 		for _, f := range recordedFiles {
-			_ = os.Remove(f)
+			if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+				recoveryErrs = append(recoveryErrs, fmt.Sprintf("remove audit record %s failed: %v", filepath.Base(f), err))
+			}
 		}
 
 		if len(recoveryErrs) > 0 {

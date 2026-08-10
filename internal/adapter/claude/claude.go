@@ -360,6 +360,10 @@ func (c *ClaudeAdapter) ImportV2(ctx context.Context, machineID string, opCtx *a
 			if strings.Contains(logicalKey, "memory") {
 				kind = model.KindMemoryV2
 			}
+			modTime := time.Now()
+			if info, serr := os.Stat(detail.Path); serr == nil {
+				modTime = info.ModTime()
+			}
 			env := &model.EnvelopeV2{
 				ID:            adapter.GenerateStableEntityID("api", c.Name(), logicalKey),
 				SchemaVersion: model.SchemaVersionV2,
@@ -378,7 +382,7 @@ func (c *ClaudeAdapter) ImportV2(ctx context.Context, machineID string, opCtx *a
 					Importance:      8,
 					Confidence:      1.0,
 					Derivation:      model.DerivationImported,
-					LastConfirmedAt: time.Now(),
+					LastConfirmedAt: modTime,
 					Evidence:        evidence,
 					ReviewState:     "approved",
 				},

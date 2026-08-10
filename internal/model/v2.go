@@ -3,10 +3,10 @@ package model
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -412,201 +412,305 @@ func (e *EnvelopeV2) Clone() *EnvelopeV2 {
 	return &cloned
 }
 
+type canonicalKV struct {
+	K string `json:"k"`
+	V string `json:"v"`
+}
+
+type canonicalProvenance struct {
+	Provider          string `json:"provider"`
+	SourcePath        string `json:"source_path"`
+	ImportedAt        string `json:"imported_at,omitempty"`
+	SourceFingerprint string `json:"source_fingerprint,omitempty"`
+}
+
+type canonicalEvidence struct {
+	SourceRecordID string `json:"source_record_id"`
+	SourceRevision int    `json:"source_revision"`
+	ContentHash    string `json:"content_hash"`
+	ExcerptHash    string `json:"excerpt_hash,omitempty"`
+}
+
+type canonicalMemoryPayload struct {
+	Statement       string              `json:"statement"`
+	Category        MemoryCategory      `json:"category"`
+	Status          MemoryStatus        `json:"status"`
+	Importance      int                 `json:"importance"`
+	Confidence      float64             `json:"confidence"`
+	Derivation      MemoryDerivation    `json:"derivation"`
+	ValidFrom       *string             `json:"valid_from,omitempty"`
+	ValidUntil      *string             `json:"valid_until,omitempty"`
+	LastConfirmedAt string              `json:"last_confirmed_at"`
+	Supersedes      []string            `json:"supersedes,omitempty"`
+	ConflictsWith   []string            `json:"conflicts_with,omitempty"`
+	Evidence        []canonicalEvidence `json:"evidence,omitempty"`
+	ReviewState     string              `json:"review_state"`
+}
+
+type canonicalSourceRecordPayload struct {
+	Provider         string        `json:"provider"`
+	SurfaceType      string        `json:"surface_type"`
+	LogicalSourceKey string        `json:"logical_source_key"`
+	ContentType      string        `json:"content_type"`
+	Content          string        `json:"content"`
+	Files            []canonicalKV `json:"files,omitempty"`
+	SourceHash       string        `json:"source_hash"`
+	Status           string        `json:"status"`
+}
+
+type canonicalSkillPayload struct {
+	Name           string          `json:"name"`
+	Description    string          `json:"description"`
+	SkillMD        string          `json:"skill_md"`
+	Scripts        []canonicalKV   `json:"scripts,omitempty"`
+	References     []canonicalKV   `json:"references,omitempty"`
+	Assets         []canonicalKV   `json:"assets,omitempty"`
+	TrustState     SkillTrustState `json:"trust_state"`
+	HasExecutables bool            `json:"has_executables"`
+}
+
+type canonicalAgentPayload struct {
+	Name                string   `json:"name"`
+	Description         string   `json:"description"`
+	Instructions        string   `json:"instructions"`
+	PreferredModelClass string   `json:"preferred_model_class,omitempty"`
+	Capabilities        []string `json:"capabilities,omitempty"`
+	Skills              []string `json:"skills,omitempty"`
+}
+
+type canonicalMCPPayload struct {
+	Name               string   `json:"name"`
+	Command            string   `json:"command"`
+	Args               []string `json:"args,omitempty"` // PRESERVED ORDER — execution arguments
+	URL                string   `json:"url,omitempty"`
+	Transport          string   `json:"transport"`
+	EnvVarNames        []string `json:"env_var_names,omitempty"`
+	WorkingDirPolicy   string   `json:"working_dir_policy,omitempty"`
+	RequiresCredential bool     `json:"requires_credential"`
+}
+
+type revisionProjection struct {
+	Kind        EntityKind            `json:"kind"`
+	Scope       Scope                 `json:"scope"`
+	ProjectID   string                `json:"project_id,omitempty"`
+	Lifecycle   Lifecycle             `json:"lifecycle"`
+	Sensitivity Sensitivity           `json:"sensitivity"`
+	Tags        []string              `json:"tags,omitempty"`
+	Provenance  []canonicalProvenance `json:"provenance,omitempty"`
+	Metadata    []canonicalKV         `json:"metadata,omitempty"`
+	Payload     any                   `json:"payload"`
+}
+
+func mapToCanonicalKV(m map[string]string) []canonicalKV {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	res := make([]canonicalKV, len(keys))
+	for i, k := range keys {
+		res[i] = canonicalKV{K: k, V: m[k]}
+	}
+	return res
+}
+
+func formatTimeNano(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func formatTimeNanoPtr(t *time.Time) *string {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	s := t.UTC().Format(time.RFC3339Nano)
+	return &s
+}
+
+func canonicalizeEvidence(links []EvidenceLink) []canonicalEvidence {
+	if len(links) == 0 {
+		return nil
+	}
+	res := make([]canonicalEvidence, len(links))
+	for i, link := range links {
+		res[i] = canonicalEvidence{
+			SourceRecordID: link.SourceRecordID,
+			SourceRevision: link.SourceRevision,
+			ContentHash:    link.ContentHash,
+			ExcerptHash:    link.ExcerptHash,
+		}
+	}
+	sort.Slice(res, func(i, j int) bool {
+		if res[i].SourceRecordID != res[j].SourceRecordID {
+			return res[i].SourceRecordID < res[j].SourceRecordID
+		}
+		if res[i].SourceRevision != res[j].SourceRevision {
+			return res[i].SourceRevision < res[j].SourceRevision
+		}
+		if res[i].ContentHash != res[j].ContentHash {
+			return res[i].ContentHash < res[j].ContentHash
+		}
+		return res[i].ExcerptHash < res[j].ExcerptHash
+	})
+	return res
+}
+
+func canonicalizeProvenance(provs []Provenance) []canonicalProvenance {
+	if len(provs) == 0 {
+		return nil
+	}
+	res := make([]canonicalProvenance, len(provs))
+	for i, p := range provs {
+		res[i] = canonicalProvenance{
+			Provider:          p.Provider,
+			SourcePath:        p.SourcePath,
+			ImportedAt:        formatTimeNano(p.ImportedAt),
+			SourceFingerprint: p.SourceFingerprint,
+		}
+	}
+	sort.Slice(res, func(i, j int) bool {
+		if res[i].Provider != res[j].Provider {
+			return res[i].Provider < res[j].Provider
+		}
+		if res[i].SourcePath != res[j].SourcePath {
+			return res[i].SourcePath < res[j].SourcePath
+		}
+		if res[i].ImportedAt != res[j].ImportedAt {
+			return res[i].ImportedAt < res[j].ImportedAt
+		}
+		return res[i].SourceFingerprint < res[j].SourceFingerprint
+	})
+	return res
+}
+
 // ComputeRevisionHash calculates a canonical, deterministic revision hash for a V2 entity.
 //
 // Inclusion policy:
 //   - All portable semantic state that changes the meaning of the entity is included.
+//   - Portable Envelope.Provenance is included (canonicalized by tuple: Provider|SourcePath|ImportedAt|SourceFingerprint).
 //   - Non-semantic / machine-local fields are excluded:
 //     MachineID (provenance only), LocalPathRef (local filesystem), ObservedAt (observation
-//     timestamp), Revision counter (monotonic counter — not semantic content).
+//     timestamp), Revision counter & PreviousRevision (monotonic counter / ancestry — not current content).
 //
 // Collection ordering:
-//   - Unordered sets (Tags, Supersedes, ConflictsWith, EnvVarNames, map keys) are sorted
-//     before hashing so that insertion order does not affect the hash.
-//   - IMPORTANT: MCPToolDef.Args are NOT sorted. Command arguments are ordered and
-//     changing their order is a semantic change.
+//   - Unordered sets (Tags, Supersedes, ConflictsWith, EnvVarNames, Capabilities, Skills, Provenance, Evidence, map keys)
+//     are sorted before hashing so that insertion order does not affect the hash.
+//   - IMPORTANT: MCPToolDef.Args are NOT sorted. Command arguments are ordered execution arguments.
 func ComputeRevisionHash(env *EnvelopeV2) string {
-	var payloadStr string
+	sortedTags := append([]string(nil), env.Tags...)
+	sort.Strings(sortedTags)
+
+	proj := revisionProjection{
+		Kind:        env.Kind,
+		Scope:       env.Scope,
+		ProjectID:   env.ProjectID,
+		Lifecycle:   env.Lifecycle,
+		Sensitivity: env.Sensitivity,
+		Tags:        sortedTags,
+		Provenance:  canonicalizeProvenance(env.Provenance),
+		Metadata:    mapToCanonicalKV(env.Metadata),
+	}
 
 	switch env.Kind {
 	case KindMemoryV2, KindInstructionV2, KindPreferenceV2, KindProjectContextV2:
 		if env.Memory != nil {
 			m := env.Memory
-
-			// Canonicalize validity windows as RFC3339 UTC strings (empty string if nil).
-			validFromStr := ""
-			if m.ValidFrom != nil {
-				validFromStr = m.ValidFrom.UTC().Format("2006-01-02T15:04:05Z")
-			}
-			validUntilStr := ""
-			if m.ValidUntil != nil {
-				validUntilStr = m.ValidUntil.UTC().Format("2006-01-02T15:04:05Z")
-			}
-			lastConfirmedStr := m.LastConfirmedAt.UTC().Format("2006-01-02T15:04:05Z")
-
-			// Sort unordered set fields to guarantee determinism.
 			supersedes := append([]string(nil), m.Supersedes...)
 			sort.Strings(supersedes)
 			conflictsWith := append([]string(nil), m.ConflictsWith...)
 			sort.Strings(conflictsWith)
 
-			// Canonicalize Evidence: sort by SourceRecordID then SourceRevision,
-			// then encode each link as a fixed-format string.
-			type evidenceKey struct {
-				id  string
-				rev int
+			proj.Payload = canonicalMemoryPayload{
+				Statement:       m.Statement,
+				Category:        m.Category,
+				Status:          m.Status,
+				Importance:      m.Importance,
+				Confidence:      m.Confidence,
+				Derivation:      m.Derivation,
+				ValidFrom:       formatTimeNanoPtr(m.ValidFrom),
+				ValidUntil:      formatTimeNanoPtr(m.ValidUntil),
+				LastConfirmedAt: formatTimeNano(m.LastConfirmedAt),
+				Supersedes:      supersedes,
+				ConflictsWith:   conflictsWith,
+				Evidence:        canonicalizeEvidence(m.Evidence),
+				ReviewState:     m.ReviewState,
 			}
-			type evidenceEntry struct {
-				k evidenceKey
-				v EvidenceLink
-			}
-			evEntries := make([]evidenceEntry, len(m.Evidence))
-			for i, ev := range m.Evidence {
-				evEntries[i] = evidenceEntry{k: evidenceKey{ev.SourceRecordID, ev.SourceRevision}, v: ev}
-			}
-			sort.Slice(evEntries, func(i, j int) bool {
-				ki, kj := evEntries[i].k, evEntries[j].k
-				if ki.id != kj.id {
-					return ki.id < kj.id
-				}
-				return ki.rev < kj.rev
-			})
-			evidenceParts := make([]string, len(evEntries))
-			for i, ee := range evEntries {
-				evidenceParts[i] = fmt.Sprintf("%s|%d|%s|%s",
-					ee.v.SourceRecordID, ee.v.SourceRevision, ee.v.ContentHash, ee.v.ExcerptHash)
-			}
-
-			payloadStr = fmt.Sprintf(
-				"stmt:%s|cat:%s|stat:%s|imp:%d|conf:%.4f|deriv:%s|"+
-					"validfrom:%s|validuntil:%s|lastconfirmed:%s|"+
-					"supersedes:%s|conflicts:%s|evidence:%s|revst:%s",
-				m.Statement, m.Category, m.Status,
-				m.Importance, m.Confidence, m.Derivation,
-				validFromStr, validUntilStr, lastConfirmedStr,
-				strings.Join(supersedes, ","),
-				strings.Join(conflictsWith, ","),
-				strings.Join(evidenceParts, ";"),
-				m.ReviewState,
-			)
 		}
 
 	case KindSourceRecord:
 		if env.SourceRecord != nil {
 			sr := env.SourceRecord
-			// Include all portable semantic fields.
-			// Excluded: MachineID (local provenance), LocalPathRef (local filesystem path),
-			//           ObservedAt (observation metadata, not content).
-			var fileKeys []string
-			for k := range sr.Files {
-				fileKeys = append(fileKeys, k)
+			proj.Payload = canonicalSourceRecordPayload{
+				Provider:         sr.Provider,
+				SurfaceType:      sr.SurfaceType,
+				LogicalSourceKey: sr.LogicalSourceKey,
+				ContentType:      sr.ContentType,
+				Content:          sr.Content,
+				Files:            mapToCanonicalKV(sr.Files),
+				SourceHash:       sr.SourceHash,
+				Status:           sr.Status,
 			}
-			sort.Strings(fileKeys)
-			fileParts := make([]string, len(fileKeys))
-			for i, k := range fileKeys {
-				fileParts[i] = k + "=" + sr.Files[k]
-			}
-			payloadStr = fmt.Sprintf(
-				"prov:%s|surf:%s|key:%s|ctype:%s|content:%s|files:%s|hash:%s|stat:%s|rev:%d|prevrev:%s",
-				sr.Provider, sr.SurfaceType, sr.LogicalSourceKey,
-				sr.ContentType, sr.Content,
-				strings.Join(fileParts, ";"),
-				sr.SourceHash, sr.Status, sr.Revision, sr.PreviousRevision,
-			)
 		}
 
 	case KindSkillPackage:
 		if env.Skill != nil {
-			var scriptKeys, refKeys, assetKeys []string
-			for k := range env.Skill.Scripts {
-				scriptKeys = append(scriptKeys, k)
+			sk := env.Skill
+			proj.Payload = canonicalSkillPayload{
+				Name:           sk.Name,
+				Description:    sk.Description,
+				SkillMD:        sk.SkillMD,
+				Scripts:        mapToCanonicalKV(sk.Scripts),
+				References:     mapToCanonicalKV(sk.References),
+				Assets:         mapToCanonicalKV(sk.Assets),
+				TrustState:     sk.TrustState,
+				HasExecutables: sk.HasExecutables,
 			}
-			for k := range env.Skill.References {
-				refKeys = append(refKeys, k)
-			}
-			for k := range env.Skill.Assets {
-				assetKeys = append(assetKeys, k)
-			}
-			sort.Strings(scriptKeys)
-			sort.Strings(refKeys)
-			sort.Strings(assetKeys)
-			scriptParts := make([]string, len(scriptKeys))
-			refParts := make([]string, len(refKeys))
-			assetParts := make([]string, len(assetKeys))
-			for i, k := range scriptKeys {
-				scriptParts[i] = k + "=" + env.Skill.Scripts[k]
-			}
-			for i, k := range refKeys {
-				refParts[i] = k + "=" + env.Skill.References[k]
-			}
-			for i, k := range assetKeys {
-				assetParts[i] = k + "=" + env.Skill.Assets[k]
-			}
-			payloadStr = fmt.Sprintf("name:%s|desc:%s|md:%s|trust:%s|exec:%v|scripts:%s|refs:%s|assets:%s",
-				env.Skill.Name, env.Skill.Description, env.Skill.SkillMD,
-				env.Skill.TrustState, env.Skill.HasExecutables,
-				strings.Join(scriptParts, ";"),
-				strings.Join(refParts, ";"),
-				strings.Join(assetParts, ";"))
 		}
 
 	case KindAgentDef:
 		if env.Agent != nil {
-			caps := append([]string(nil), env.Agent.Capabilities...)
-			skills := append([]string(nil), env.Agent.Skills...)
+			ag := env.Agent
+			caps := append([]string(nil), ag.Capabilities...)
 			sort.Strings(caps)
+			skills := append([]string(nil), ag.Skills...)
 			sort.Strings(skills)
-			payloadStr = fmt.Sprintf("name:%s|desc:%s|inst:%s|model:%s|caps:%s|skills:%s",
-				env.Agent.Name, env.Agent.Description, env.Agent.Instructions,
-				env.Agent.PreferredModelClass,
-				strings.Join(caps, ","), strings.Join(skills, ","))
+
+			proj.Payload = canonicalAgentPayload{
+				Name:                ag.Name,
+				Description:         ag.Description,
+				Instructions:        ag.Instructions,
+				PreferredModelClass: ag.PreferredModelClass,
+				Capabilities:        caps,
+				Skills:              skills,
+			}
 		}
 
 	case KindMCPToolDef:
 		if env.MCPTool != nil {
-			// Args order is PRESERVED — these are ordered command-line arguments.
-			// Changing arg order is a semantic change and must change the hash.
-			envVars := append([]string(nil), env.MCPTool.EnvVarNames...)
-			sort.Strings(envVars) // env var names are a set; order is not significant
-			payloadStr = fmt.Sprintf(
-				"name:%s|cmd:%s|args:%s|url:%s|trans:%s|envvars:%s|wdpol:%s|reqcred:%v",
-				env.MCPTool.Name, env.MCPTool.Command,
-				strings.Join(env.MCPTool.Args, "\x00"), // use NUL separator — args may contain commas
-				env.MCPTool.URL, env.MCPTool.Transport,
-				strings.Join(envVars, ","),
-				env.MCPTool.WorkingDirPolicy,
-				env.MCPTool.RequiresCredential,
-			)
+			mcp := env.MCPTool
+			envVars := append([]string(nil), mcp.EnvVarNames...)
+			sort.Strings(envVars)
+
+			proj.Payload = canonicalMCPPayload{
+				Name:               mcp.Name,
+				Command:            mcp.Command,
+				Args:               mcp.Args, // PRESERVED ORDER — command line arguments
+				URL:                mcp.URL,
+				Transport:          mcp.Transport,
+				EnvVarNames:        envVars,
+				WorkingDirPolicy:   mcp.WorkingDirPolicy,
+				RequiresCredential: mcp.RequiresCredential,
+			}
 		}
 	}
 
-	metaStr := ""
-	if len(env.Metadata) > 0 {
-		var keys []string
-		for k := range env.Metadata {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			metaStr += fmt.Sprintf("%s=%s;", k, env.Metadata[k])
-		}
-	}
-
-	tagsStr := ""
-	if len(env.Tags) > 0 {
-		sortedTags := append([]string(nil), env.Tags...)
-		sort.Strings(sortedTags)
-		tagsStr = strings.Join(sortedTags, ",")
-	}
-
-	// NOTE: Revision (monotonic counter) is intentionally excluded — it is not semantic
-	// state. Two entities with different revision counters but identical content have the
-	// same semantic meaning and should produce the same RevisionHash, which lets the
-	// reconciler detect true no-ops even across sync roundtrips.
-	combined := fmt.Sprintf("kind:%s|scope:%s|proj:%s|sens:%s|life:%s|tags:%s|meta:%s|payload:%s",
-		env.Kind, env.Scope, env.ProjectID, env.Sensitivity, env.Lifecycle, tagsStr, metaStr, payloadStr)
-
-	return ComputeFingerprint(KindMemory, ScopeGlobal, "v2_revision", combined, nil)
+	data, _ := json.Marshal(proj)
+	return ComputeFingerprint(KindMemory, ScopeGlobal, "v2_revision", string(data), nil)
 }
 
 // ComputeV2StateRoot calculates a deterministic state root from V2 envelopes sorted by ID.

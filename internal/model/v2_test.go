@@ -323,3 +323,112 @@ func TestRevisionHashMapOrderingDeterministic(t *testing.T) {
 		t.Errorf("expected RevisionHash to be identical regardless of Metadata map iteration order")
 	}
 }
+
+func TestRevisionHashChangesWhenProvenanceChanges(t *testing.T) {
+	env1 := baseMemoryEnvelope()
+	h1 := model.ComputeRevisionHash(env1)
+
+	env2 := env1.Clone()
+	env2.Provenance = []model.Provenance{
+		{
+			Provider:          "claude",
+			SourcePath:        "CLAUDE.md",
+			ImportedAt:        time.Now(),
+			SourceFingerprint: "fingerprint123",
+		},
+	}
+	h2 := model.ComputeRevisionHash(env2)
+
+	if h1 == h2 {
+		t.Errorf("expected RevisionHash to change when portable Provenance is added")
+	}
+}
+
+func TestRevisionHashPreservesFloatPrecision(t *testing.T) {
+	env1 := baseMemoryEnvelope()
+	env1.Memory.Confidence = 0.90001
+	h1 := model.ComputeRevisionHash(env1)
+
+	env2 := env1.Clone()
+	env2.Memory.Confidence = 0.90002
+	h2 := model.ComputeRevisionHash(env2)
+
+	if h1 == h2 {
+		t.Errorf("expected RevisionHash to differ for Confidence 0.90001 vs 0.90002 (float precision loss detected)")
+	}
+}
+
+func TestRevisionHashPreservesTimestampPrecision(t *testing.T) {
+	env1 := baseMemoryEnvelope()
+	now := time.Date(2026, 8, 10, 15, 0, 0, 100000000, time.UTC) // .1s
+	env1.Memory.ValidFrom = &now
+	h1 := model.ComputeRevisionHash(env1)
+
+	env2 := env1.Clone()
+	laterSubSecond := time.Date(2026, 8, 10, 15, 0, 0, 200000000, time.UTC) // .2s
+	env2.Memory.ValidFrom = &laterSubSecond
+	h2 := model.ComputeRevisionHash(env2)
+
+	if h1 == h2 {
+		t.Errorf("expected RevisionHash to differ for sub-second timestamp precision difference")
+	}
+}
+
+func TestRevisionHashEvidenceOrderingDeterministic(t *testing.T) {
+	env1 := baseMemoryEnvelope()
+	env1.Memory.Evidence = []model.EvidenceLink{
+		{SourceRecordID: "sr_a", SourceRevision: 1, ContentHash: "hash_a", ExcerptHash: "ex_a"},
+		{SourceRecordID: "sr_b", SourceRevision: 2, ContentHash: "hash_b", ExcerptHash: "ex_b"},
+	}
+	h1 := model.ComputeRevisionHash(env1)
+
+	env2 := env1.Clone()
+	env2.Memory.Evidence = []model.EvidenceLink{
+		{SourceRecordID: "sr_b", SourceRevision: 2, ContentHash: "hash_b", ExcerptHash: "ex_b"},
+		{SourceRecordID: "sr_a", SourceRevision: 1, ContentHash: "hash_a", ExcerptHash: "ex_a"},
+	}
+	h2 := model.ComputeRevisionHash(env2)
+
+	if h1 != h2 {
+		t.Errorf("expected RevisionHash to be identical regardless of Evidence slice input ordering")
+	}
+}
+
+func TestRevisionHashSameSemanticStateSameHash(t *testing.T) {
+	env1 := baseMemoryEnvelope()
+	env1.Revision = 1
+	h1 := model.ComputeRevisionHash(env1)
+
+	env2 := env1.Clone()
+	env2.Revision = 999 // monotonic processing counter increment
+	h2 := model.ComputeRevisionHash(env2)
+
+	if h1 != h2 {
+		t.Errorf("expected identical portable semantic state to yield identical RevisionHash regardless of revision counter")
+	}
+}
+
+func TestRevisionHashMCPArgsRemainOrdered(t *testing.T) {
+	env1 := &model.EnvelopeV2{
+		ID:            "apt_mcp_ordered",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMCPToolDef,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		MCPTool: &model.MCPToolDef{
+			Name:      "test_mcp",
+			Command:   "node",
+			Args:      []string{"--input", "foo"},
+			Transport: "stdio",
+		},
+	}
+	h1 := model.ComputeRevisionHash(env1)
+
+	env2 := env1.Clone()
+	env2.MCPTool.Args = []string{"foo", "--input"}
+	h2 := model.ComputeRevisionHash(env2)
+
+	if h1 == h2 {
+		t.Errorf("expected RevisionHash to differ when MCP execution argument order changes")
+	}
+}
