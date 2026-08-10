@@ -12,6 +12,62 @@ import (
 	"github.com/StealthMoud/AgentPort/internal/vault"
 )
 
+func TestFreshVaultInitializesAsV2(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load failed: %v", err)
+	}
+
+	v, err := vault.Initialize(cfg)
+	if err != nil {
+		t.Fatalf("vault.Initialize failed: %v", err)
+	}
+
+	if v.Metadata.SchemaVersion != model.SchemaVersionV2 {
+		t.Errorf("expected Metadata.SchemaVersion == %s, got %s", model.SchemaVersionV2, v.Metadata.SchemaVersion)
+	}
+
+	if v.Metadata.FormatVersion != "2" {
+		t.Errorf("expected Metadata.FormatVersion == '2', got %s", v.Metadata.FormatVersion)
+	}
+
+	if len(v.ListArtifacts()) != 0 {
+		t.Errorf("expected 0 legacy artifacts in fresh V2 vault, got %d", len(v.ListArtifacts()))
+	}
+
+	env := &model.EnvelopeV2{
+		ID:            "apm_fresh_v2_test",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Fresh V2 test statement",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	env.RevisionHash = model.ComputeRevisionHash(env)
+	if err := v.SaveEntity(env); err != nil {
+		t.Fatalf("SaveEntity failed: %v", err)
+	}
+
+	entities := v.ListEntities()
+	if len(entities) != 1 {
+		t.Fatalf("expected 1 V2 entity after SaveEntity, got %d", len(entities))
+	}
+}
+
 func TestVaultInitializationAndArtifactOperations(t *testing.T) {
 	tempDir := t.TempDir()
 	homeDir := filepath.Join(tempDir, "agentport_home")
@@ -488,5 +544,65 @@ func TestTombstoneLoopPrevention(t *testing.T) {
 	secondCount := len(t2)
 	if secondCount != firstCount {
 		t.Errorf("expected tombstone list length unchanged on re-applying remote tombstone (%d), got %d (infinite tombstone loop!)", firstCount, secondCount)
+	}
+}
+
+func TestFailedDeleteTransactionDoesNotLeaveTombstone(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	env := &model.EnvelopeV2{
+		ID:            "apm_tx_fail_test",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Should survive failed transaction deletion",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	env.RevisionHash = model.ComputeRevisionHash(env)
+	_ = v.SaveEntity(env)
+
+	tx := v.BeginTx()
+	_ = tx.DeleteEntity(env.ID)
+
+	// Commit with fault hook returning an error before atomic swap
+	err := tx.CommitWithFaultHook(func(phase string) error {
+		if phase == "pre_swap" {
+			return fmt.Errorf("injected pre_swap failure")
+		}
+		return nil
+	})
+
+	if err == nil {
+		t.Fatalf("expected commit to fail due to fault hook")
+	}
+
+	// Reopen vault from disk
+	reopened, err := vault.LoadOpen(cfg)
+	if err != nil {
+		t.Fatalf("vault.LoadOpen failed: %v", err)
+	}
+
+	// Assert entity still exists and NO tombstone was created
+	if _, exists := reopened.GetEntity(env.ID); !exists {
+		t.Errorf("expected entity to still exist on disk after failed transaction deletion!")
+	}
+
+	if _, tombExists := reopened.GetTombstone(env.ID); tombExists {
+		t.Errorf("failed delete transaction leaked orphaned tombstone to disk!")
 	}
 }

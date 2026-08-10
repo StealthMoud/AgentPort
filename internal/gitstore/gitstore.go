@@ -26,11 +26,14 @@ var (
 )
 
 type ManifestObject struct {
-	OpaqueID      string    `json:"opaque_id"`
-	Fingerprint   string    `json:"fingerprint"`
-	EncryptedSize int64     `json:"encrypted_size"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	IsTombstone   bool      `json:"is_tombstone,omitempty"`
+	OpaqueID             string    `json:"opaque_id"`
+	Fingerprint          string    `json:"fingerprint"`
+	EncryptedSize        int64     `json:"encrypted_size"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	IsTombstone          bool      `json:"is_tombstone,omitempty"`
+	DeletedRevision      int       `json:"deleted_revision,omitempty"`
+	OriginMachineID      string    `json:"origin_machine_id,omitempty"`
+	PreviousRevisionHash string    `json:"previous_revision_hash,omitempty"`
 }
 
 type Manifest struct {
@@ -87,11 +90,17 @@ func (s *Store) EnsureRepo(ctx context.Context) error {
 
 	gitDir := filepath.Join(s.cfg.SyncRepoDir, ".git")
 	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
-		if _, err := s.execGit(ctx, "init"); err != nil {
-			return err
+		if _, err := s.execGit(ctx, "init", "-b", "main"); err != nil {
+			if _, err := s.execGit(ctx, "init"); err != nil {
+				return err
+			}
+			_, _ = s.execGit(ctx, "checkout", "-B", "main")
 		}
 		_, _ = s.execGit(ctx, "config", "user.name", "AgentPort")
 		_, _ = s.execGit(ctx, "config", "user.email", "agentport@local.internal")
+	} else {
+		// Ensure current branch is main
+		_, _ = s.execGit(ctx, "checkout", "-B", "main")
 	}
 
 	return nil
@@ -305,10 +314,13 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 			if !exists || !existingObj.IsTombstone {
 				opaqueID := model.ComputeFingerprint(model.KindMemory, model.ScopeGlobal, ts.EntityID, "tombstone", nil)[:24]
 				manifest.Objects[ts.EntityID] = &ManifestObject{
-					OpaqueID:    opaqueID,
-					Fingerprint: ts.PreviousRevisionHash,
-					UpdatedAt:   ts.DeletedAt,
-					IsTombstone: true,
+					OpaqueID:             opaqueID,
+					Fingerprint:          ts.PreviousRevisionHash,
+					UpdatedAt:            ts.DeletedAt,
+					IsTombstone:          true,
+					DeletedRevision:      ts.DeletedRevision,
+					OriginMachineID:      ts.OriginMachineID,
+					PreviousRevisionHash: ts.PreviousRevisionHash,
 				}
 				changedCount++
 			}
@@ -328,22 +340,40 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 	if err != nil {
 		return nil, err
 	}
+
 	if err := fsutil.WriteFileAtomic(manifestPath, manifestBytes, 0600); err != nil {
+		return nil, fmt.Errorf("failed saving manifest: %w", err)
+	}
+
+	// 7. Git commit and push if remote is configured
+	hasChanges, err := s.hasStagedOrUnstagedChanges(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	// Commit and push sync repository
-	_, _ = s.execGit(ctx, "add", ".")
-	commitMsg := fmt.Sprintf("Sync vault state: %d objects updated (%s)", res.ObjectsEncryptedCount, time.Now().Format(time.RFC3339))
-	if _, err := s.execGit(ctx, "commit", "-m", commitMsg); err == nil {
-		res.LocalAhead = true
-		if remoteURL != "" {
-			if _, pushErr := s.execGit(ctx, "push", "origin", "HEAD:main"); pushErr != nil {
-				res.Status = SyncStatusPushFailed
-				res.Message = fmt.Sprintf("git push to remote failed: %v", pushErr)
-				res.Warnings = append(res.Warnings, fmt.Sprintf("git push failed: %v", pushErr))
-				return res, fmt.Errorf("git push to remote failed: %w", pushErr)
-			}
+	if !hasChanges {
+		res.Status = SyncStatusSuccess
+		res.Message = "Vault already fully in sync"
+		return res, nil
+	}
+
+	if _, err := s.execGit(ctx, "add", "-A"); err != nil {
+		return nil, fmt.Errorf("failed git add: %w", err)
+	}
+
+	commitMsg := fmt.Sprintf("sync: vault state updated (%s)", time.Now().Format(time.RFC3339))
+	sha, err := s.execGit(ctx, "commit", "-m", commitMsg)
+	if err != nil {
+		return nil, fmt.Errorf("failed git commit: %w", err)
+	}
+	res.CommitSHA = sha
+
+	if remoteURL != "" {
+		_, err := s.execGit(ctx, "push", "origin", "main")
+		if err != nil {
+			res.Status = SyncStatusPushFailed
+			res.Message = fmt.Sprintf("commit succeeded locally (%s), but push to origin main failed: %v", sha, err)
+			return res, nil
 		}
 	}
 
@@ -378,8 +408,16 @@ func (s *Store) decryptObjectsIntoVault(v *vault.Vault) (int, error) {
 		if obj.IsTombstone {
 			ts := &model.Tombstone{
 				EntityID:             artID,
-				PreviousRevisionHash: obj.Fingerprint,
+				DeletedRevision:      obj.DeletedRevision,
 				DeletedAt:            obj.UpdatedAt,
+				OriginMachineID:      obj.OriginMachineID,
+				PreviousRevisionHash: obj.PreviousRevisionHash,
+			}
+			if ts.PreviousRevisionHash == "" {
+				ts.PreviousRevisionHash = obj.Fingerprint
+			}
+			if ts.DeletedRevision < 1 {
+				ts.DeletedRevision = 1
 			}
 			_ = v.ApplyRemoteTombstone(ts)
 			continue
@@ -420,4 +458,12 @@ func (s *Store) decryptObjectsIntoVault(v *vault.Vault) (int, error) {
 	}
 
 	return decryptedCount, nil
+}
+
+func (s *Store) hasStagedOrUnstagedChanges(ctx context.Context) (bool, error) {
+	out, err := s.execGit(ctx, "status", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	return len(strings.TrimSpace(out)) > 0, nil
 }

@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	contextpkg "github.com/StealthMoud/AgentPort/internal/context"
 	"github.com/StealthMoud/AgentPort/internal/gitstore"
 	"github.com/StealthMoud/AgentPort/internal/governance"
+	"github.com/StealthMoud/AgentPort/internal/model"
 	"github.com/StealthMoud/AgentPort/internal/vault"
 )
 
@@ -182,4 +184,149 @@ func TestMasterEndToEndCorrectiveCheckpoint(t *testing.T) {
 	}
 
 	t.Log("SUCCESS: Master End-to-End Corrective Checkpoint passed cleanly!")
+}
+
+func TestV2TombstonePropagationAcrossRealRemote(t *testing.T) {
+	ctx := context.Background()
+	testDir := t.TempDir()
+
+	// 1. Setup real bare git remote repository
+	remoteGitDir := filepath.Join(testDir, "remote.git")
+	cmd := exec.CommandContext(ctx, "git", "init", "--bare", remoteGitDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed initializing bare git remote: %v (%s)", err, string(out))
+	}
+
+	// 2. Setup Computer A
+	compADir := filepath.Join(testDir, "machine_a")
+	homeA := filepath.Join(compADir, "home")
+	vaultA := filepath.Join(compADir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeA)
+	t.Setenv(config.EnvVaultDir, vaultA)
+
+	cfgA, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load A failed: %v", err)
+	}
+
+	vA, err := vault.Initialize(cfgA)
+	if err != nil {
+		t.Fatalf("vault.Initialize A failed: %v", err)
+	}
+
+	storeA := gitstore.New(cfgA)
+	if err := storeA.SetRemote(ctx, remoteGitDir); err != nil {
+		t.Fatalf("SetRemote A failed: %v", err)
+	}
+
+	// Create V2 entity X on Machine A
+	entityX := &model.EnvelopeV2{
+		ID:            "apm_tombstone_propagation_test",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Entity X to test real remote tombstone propagation",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	entityX.RevisionHash = model.ComputeRevisionHash(entityX)
+	if err := vA.SaveEntity(entityX); err != nil {
+		t.Fatalf("SaveEntity X on A failed: %v", err)
+	}
+
+	// Machine A Sync to real git remote
+	if _, err := storeA.Sync(ctx, vA, false); err != nil {
+		t.Fatalf("Sync A failed: %v", err)
+	}
+
+	// 3. Setup Computer B with same identity key
+	compBDir := filepath.Join(testDir, "machine_b")
+	homeB := filepath.Join(compBDir, "home")
+	vaultB := filepath.Join(compBDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeB)
+	t.Setenv(config.EnvVaultDir, vaultB)
+
+	cfgB, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load B failed: %v", err)
+	}
+
+	_ = cfgB.EnsureDirectories()
+	keyDataA, _ := os.ReadFile(filepath.Join(cfgA.KeysDir, "identity.age"))
+	_ = os.WriteFile(filepath.Join(cfgB.KeysDir, "identity.age"), keyDataA, 0600)
+	metaDataA, _ := os.ReadFile(filepath.Join(cfgA.VaultDir, "vault.json"))
+	_ = os.WriteFile(filepath.Join(cfgB.VaultDir, "vault.json"), metaDataA, 0600)
+
+	vB, err := vault.LoadOpen(cfgB)
+	if err != nil {
+		t.Fatalf("vault.LoadOpen B failed: %v", err)
+	}
+
+	storeB := gitstore.New(cfgB)
+	if err := storeB.SetRemote(ctx, remoteGitDir); err != nil {
+		t.Fatalf("SetRemote B failed: %v", err)
+	}
+
+	// Machine B Sync (pulls entity X from real remote)
+	if _, err := storeB.Sync(ctx, vB, false); err != nil {
+		t.Fatalf("Sync B failed: %v", err)
+	}
+
+	// ASSERT 1: B has entity X
+	if _, existsOnB := vB.GetEntity(entityX.ID); !existsOnB {
+		t.Fatalf("expected Machine B to have Entity X after initial sync!")
+	}
+
+	// 4. Machine A deletes entity X and Syncs to remote
+	if err := vA.DeleteEntity(entityX.ID); err != nil {
+		t.Fatalf("DeleteEntity X on A failed: %v", err)
+	}
+
+	if _, err := storeA.Sync(ctx, vA, false); err != nil {
+		t.Fatalf("Sync A after delete failed: %v", err)
+	}
+
+	// Machine B Syncs (pulls tombstone deletion from remote)
+	if _, err := storeB.Sync(ctx, vB, false); err != nil {
+		t.Fatalf("Sync B after delete failed: %v", err)
+	}
+
+	// ASSERT 2: B no longer has entity X
+	if _, existsOnB := vB.GetEntity(entityX.ID); existsOnB {
+		t.Fatalf("Entity X was NOT deleted on Machine B after remote tombstone sync!")
+	}
+
+	// 5. Subsequent Sync cycle on A and B (verify no resurrection and no tombstone loop)
+	tombA1, _ := vA.ListTombstones()
+	tombB1, _ := vB.ListTombstones()
+	tombCountA1 := len(tombA1)
+	tombCountB1 := len(tombB1)
+
+	if _, err := storeA.Sync(ctx, vA, false); err != nil {
+		t.Fatalf("second Sync A failed: %v", err)
+	}
+	if _, err := storeB.Sync(ctx, vB, false); err != nil {
+		t.Fatalf("second Sync B failed: %v", err)
+	}
+
+	if _, existsOnB := vB.GetEntity(entityX.ID); existsOnB {
+		t.Fatalf("Entity X resurrected on Machine B after second sync cycle!")
+	}
+
+	tombA2, _ := vA.ListTombstones()
+	tombB2, _ := vB.ListTombstones()
+	tombCountA2 := len(tombA2)
+	tombCountB2 := len(tombB2)
+
+	if tombCountA1 != tombCountA2 || tombCountB1 != tombCountB2 {
+		t.Errorf("tombstone loop detected! Machine A tombstones %d -> %d, Machine B tombstones %d -> %d", tombCountA1, tombCountA2, tombCountB1, tombCountB2)
+	}
 }

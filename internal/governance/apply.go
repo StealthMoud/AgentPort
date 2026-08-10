@@ -30,13 +30,13 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 		}
 	}
 
-	// 3. Create pre-apply backup snapshot for genuine atomic undo capability
+	// 3. Create mandatory pre-apply backup snapshot for genuine atomic undo capability (FAIL CLOSED if snapshot fails)
 	snapMgr := snapshot.NewManager(cfg)
 	snap, snapErr := snapMgr.CreateSnapshot(v, "pre_governance_apply")
-	snapID := ""
-	if snapErr == nil {
-		snapID = snap.SnapshotID
+	if snapErr != nil {
+		return fmt.Errorf("failed creating mandatory pre-governance backup snapshot: %w", snapErr)
 	}
+	snapID := snap.SnapshotID
 
 	// 4. Begin atomic transaction
 	tx := v.BeginTx()
@@ -51,13 +51,13 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 				Scope:         model.ScopeGlobal,
 				Revision:      1,
 				Memory: &model.MemoryPayload{
-					Statement:       prop.ProposedState,
-					Category:        model.CategoryWorkflow,
-					Status:          model.MemoryStatusActive,
-					Importance:      8,
-					Confidence:      prop.Confidence,
-					Derivation:      model.DerivationSummarized,
-					ReviewState:     "approved",
+					Statement:   prop.ProposedState,
+					Category:    model.CategoryWorkflow,
+					Status:      model.MemoryStatusActive,
+					Importance:  8,
+					Confidence:  prop.Confidence,
+					Derivation:  model.DerivationSummarized,
+					ReviewState: "approved",
 				},
 			}
 			env.RevisionHash = model.ComputeRevisionHash(env)
@@ -74,14 +74,14 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 				Scope:         model.ScopeGlobal,
 				Revision:      1,
 				Memory: &model.MemoryPayload{
-					Statement:       prop.ProposedState,
-					Category:        model.CategoryWorkflow,
-					Status:          model.MemoryStatusActive,
-					Importance:      8,
-					Confidence:      prop.Confidence,
-					Derivation:      model.DerivationSummarized,
-					Supersedes:      prop.TargetIDs,
-					ReviewState:     "approved",
+					Statement:   prop.ProposedState,
+					Category:    model.CategoryWorkflow,
+					Status:      model.MemoryStatusActive,
+					Importance:  8,
+					Confidence:  prop.Confidence,
+					Derivation:  model.DerivationSummarized,
+					Supersedes:  prop.TargetIDs,
+					ReviewState: "approved",
 				},
 			}
 			mergedEnv.RevisionHash = model.ComputeRevisionHash(mergedEnv)
@@ -93,7 +93,7 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 			for _, tid := range prop.TargetIDs {
 				if existing, ok := v.GetEntity(tid); ok && existing.Memory != nil {
 					existing.Memory.Status = model.MemoryStatusSuperseded
-					if err := tx.SaveEntity(existing); err != nil {
+					if err := tx.UpdateEntity(existing); err != nil {
 						_ = tx.Rollback()
 						return err
 					}
@@ -104,7 +104,7 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 			for _, tid := range prop.TargetIDs {
 				if existing, ok := v.GetEntity(tid); ok && existing.Memory != nil {
 					existing.Memory.Statement = prop.ProposedState
-					if err := tx.SaveEntity(existing); err != nil {
+					if err := tx.UpdateEntity(existing); err != nil {
 						_ = tx.Rollback()
 						return err
 					}
@@ -119,14 +119,14 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 				Scope:         model.ScopeGlobal,
 				Revision:      1,
 				Memory: &model.MemoryPayload{
-					Statement:       prop.ProposedState,
-					Category:        model.CategoryWorkflow,
-					Status:          model.MemoryStatusActive,
-					Importance:      8,
-					Confidence:      prop.Confidence,
-					Derivation:      model.DerivationSummarized,
-					Supersedes:      prop.TargetIDs,
-					ReviewState:     "approved",
+					Statement:   prop.ProposedState,
+					Category:    model.CategoryWorkflow,
+					Status:      model.MemoryStatusActive,
+					Importance:  8,
+					Confidence:  prop.Confidence,
+					Derivation:  model.DerivationSummarized,
+					Supersedes:  prop.TargetIDs,
+					ReviewState: "approved",
 				},
 			}
 			newEnv.RevisionHash = model.ComputeRevisionHash(newEnv)
@@ -138,7 +138,7 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 			for _, tid := range prop.TargetIDs {
 				if existing, ok := v.GetEntity(tid); ok && existing.Memory != nil {
 					existing.Memory.Status = model.MemoryStatusSuperseded
-					if err := tx.SaveEntity(existing); err != nil {
+					if err := tx.UpdateEntity(existing); err != nil {
 						_ = tx.Rollback()
 						return err
 					}
@@ -149,7 +149,7 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 			for _, tid := range prop.TargetIDs {
 				if existing, ok := v.GetEntity(tid); ok && existing.Memory != nil {
 					existing.Memory.Status = model.MemoryStatusArchived
-					if err := tx.SaveEntity(existing); err != nil {
+					if err := tx.UpdateEntity(existing); err != nil {
 						_ = tx.Rollback()
 						return err
 					}
@@ -161,7 +161,7 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 				if existing, ok := v.GetEntity(tid); ok && existing.Memory != nil {
 					existing.Memory.Status = model.MemoryStatusContested
 					existing.Memory.ConflictsWith = append(existing.Memory.ConflictsWith, prop.TargetIDs...)
-					if err := tx.SaveEntity(existing); err != nil {
+					if err := tx.UpdateEntity(existing); err != nil {
 						_ = tx.Rollback()
 						return err
 					}
@@ -172,7 +172,7 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 			for _, tid := range prop.TargetIDs {
 				if existing, ok := v.GetEntity(tid); ok && existing.Memory != nil {
 					existing.Memory.Status = model.MemoryStatusExpired
-					if err := tx.SaveEntity(existing); err != nil {
+					if err := tx.UpdateEntity(existing); err != nil {
 						_ = tx.Rollback()
 						return err
 					}
@@ -184,7 +184,7 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 			for _, tid := range prop.TargetIDs {
 				if existing, ok := v.GetEntity(tid); ok && existing.Memory != nil {
 					existing.Memory.Category = newCat
-					if err := tx.SaveEntity(existing); err != nil {
+					if err := tx.UpdateEntity(existing); err != nil {
 						_ = tx.Rollback()
 						return err
 					}
@@ -203,14 +203,18 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 
 	for _, prop := range props {
 		prop.Status = compiler.ProposalStatusAccepted
-		_ = ps.SaveProposal(prop)
-		_ = j.RecordEvent(&AuditEvent{
+		if err := ps.SaveProposal(prop); err != nil {
+			return fmt.Errorf("failed saving proposal status for %s: %w", prop.ID, err)
+		}
+		if err := j.RecordEvent(&AuditEvent{
 			Actor:      "memory_compiler",
 			Operation:  string(prop.Operation),
 			ProposalID: prop.ID,
 			TargetID:   prop.ID,
 			SnapshotID: snapID,
-		})
+		}); err != nil {
+			return fmt.Errorf("failed recording audit event for %s: %w", prop.ID, err)
+		}
 	}
 
 	return nil

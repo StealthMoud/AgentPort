@@ -22,6 +22,7 @@ import (
 	"github.com/StealthMoud/AgentPort/internal/governance"
 	"github.com/StealthMoud/AgentPort/internal/model"
 	"github.com/StealthMoud/AgentPort/internal/optimizer"
+	"github.com/StealthMoud/AgentPort/internal/reconcile"
 	"github.com/StealthMoud/AgentPort/internal/snapshot"
 	"github.com/StealthMoud/AgentPort/internal/vault"
 	"github.com/StealthMoud/AgentPort/internal/version"
@@ -215,6 +216,8 @@ func newStatusCmd() *cobra.Command {
 
 			entities := v.ListEntities()
 			artifacts := v.ListArtifacts()
+			tombstones, _ := v.ListTombstones()
+			tombstoneCount := len(tombstones)
 			stateRoot := model.ComputeV2StateRoot(entities)
 			if len(entities) == 0 {
 				stateRoot = compiler.ComputeStateRoot(artifacts)
@@ -222,13 +225,14 @@ func newStatusCmd() *cobra.Command {
 
 			if jsonOutput {
 				statusObj := map[string]interface{}{
-					"vault_id":       v.Metadata.VaultID,
-					"schema_version": v.Metadata.SchemaVersion,
-					"entity_count":   len(entities),
-					"artifact_count": len(artifacts),
-					"state_root":     stateRoot,
-					"remote_url":     remoteURL,
-					"machine_id":     v.Machine.MachineID,
+					"vault_id":        v.Metadata.VaultID,
+					"schema_version":  v.Metadata.SchemaVersion,
+					"entity_count":    len(entities),
+					"artifact_count":  len(artifacts),
+					"tombstone_count": tombstoneCount,
+					"state_root":      stateRoot,
+					"remote_url":      remoteURL,
+					"machine_id":      v.Machine.MachineID,
 				}
 				data, _ := json.MarshalIndent(statusObj, "", "  ")
 				fmt.Println(string(data))
@@ -241,6 +245,7 @@ func newStatusCmd() *cobra.Command {
 			fmt.Printf("Schema:       %s\n", v.Metadata.SchemaVersion)
 			fmt.Printf("V2 Entities:  %d\n", len(entities))
 			fmt.Printf("V1 Artifacts: %d\n", len(artifacts))
+			fmt.Printf("Tombstones:   %d\n", tombstoneCount)
 			fmt.Printf("State Root:   %s\n", stateRoot)
 			fmt.Printf("Machine ID:   %s\n", v.Machine.MachineID)
 			if remoteURL != "" {
@@ -416,24 +421,42 @@ func newImportCmd() *cobra.Command {
 				opCtx.ProjectID = model.ComputeFingerprint(model.KindProjectContext, model.ScopeProject, workspaceFlag, workspaceFlag, nil)[:16]
 			}
 
-			importedCount := 0
+			allImported := make([]*model.EnvelopeV2, 0)
 			for name, ad := range adapters {
 				envs, err := ad.ImportV2(ctx, v.Machine.MachineID, opCtx)
 				if err != nil {
 					fmt.Printf("Error importing from %s: %v\n", name, err)
 					continue
 				}
-
-				for _, env := range envs {
-					if err := v.SaveEntity(env); err == nil {
-						importedCount++
-					}
-				}
-				fmt.Printf("Imported %d V2 entities from %s\n", len(envs), name)
+				allImported = append(allImported, envs...)
 			}
 
-			fmt.Println()
-			fmt.Printf("Total imported into vault: %d\n", importedCount)
+			reconciled, err := reconcile.ReconcileV2(v, allImported)
+			if err != nil {
+				return fmt.Errorf("reconciliation failed: %w", err)
+			}
+
+			tx := v.BeginTx()
+			for _, env := range reconciled.Created {
+				if err := tx.SaveEntity(env); err != nil {
+					_ = tx.Rollback()
+					return fmt.Errorf("failed saving created entity %s: %w", env.ID, err)
+				}
+			}
+			for _, env := range reconciled.Updated {
+				if err := tx.UpdateEntity(env); err != nil {
+					_ = tx.Rollback()
+					return fmt.Errorf("failed updating entity %s: %w", env.ID, err)
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("failed committing imported entities: %w", err)
+			}
+
+			fmt.Println("Import Reconciliation Summary:")
+			fmt.Printf("  Created:   %d\n", len(reconciled.Created))
+			fmt.Printf("  Updated:   %d\n", len(reconciled.Updated))
+			fmt.Printf("  Unchanged: %d\n", len(reconciled.Unchanged))
 			return nil
 		},
 	}

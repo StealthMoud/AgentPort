@@ -1,6 +1,7 @@
 package governance_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -306,7 +307,7 @@ func TestGovernanceProposalOperations(t *testing.T) {
 	}
 }
 
-func TestGovernanceStateRootValidation(t *testing.T) {
+func TestV2StateRootChangesAfterSemanticMutation(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
 	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
@@ -314,15 +315,114 @@ func TestGovernanceStateRootValidation(t *testing.T) {
 	cfg, _ := config.Load()
 	v, _ := vault.Initialize(cfg)
 
-	staleProp := &compiler.Proposal{
-		ID:             "prop_stale_root",
-		Operation:      compiler.OpCreate,
-		ProposedState:  "State statement",
-		InputStateRoot: "STALE_EXPECTED_ROOT_HASH_9999",
+	env := &model.EnvelopeV2{
+		ID:            "apm_stateroot_test",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Initial state root statement",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	env.RevisionHash = model.ComputeRevisionHash(env)
+	_ = v.SaveEntity(env)
+
+	root1 := model.ComputeV2StateRoot(v.ListEntities())
+
+	// Refine / update entity
+	envMutated := env.Clone()
+	envMutated.Memory.Statement = "MUTATED state root statement"
+	_ = v.UpdateEntity(envMutated)
+
+	root2 := model.ComputeV2StateRoot(v.ListEntities())
+
+	if root1 == root2 {
+		t.Fatalf("expected state root to change after semantic mutation, got identical root %s", root1)
+	}
+}
+
+func TestV2ProposalRejectedAfterEntityMutation(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	env := &model.EnvelopeV2{
+		ID:            "apm_stale_prop_test",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Original statement before proposal generation",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	env.RevisionHash = model.ComputeRevisionHash(env)
+	_ = v.SaveEntity(env)
+
+	root1 := model.ComputeV2StateRoot(v.ListEntities())
+
+	prop := &compiler.Proposal{
+		ID:             "prop_stale_mutation",
+		Operation:      compiler.OpRefine,
+		TargetIDs:      []string{env.ID},
+		ProposedState:  "Proposal statement",
+		InputStateRoot: root1,
 	}
 
-	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{staleProp})
+	// Mutate entity X before applying proposal
+	envMutated := env.Clone()
+	envMutated.Memory.Statement = "CONCURRENT MUTATION BEFORE APPLY"
+	_ = v.UpdateEntity(envMutated)
+
+	// Apply proposal with now stale root1
+	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{prop})
 	if err == nil {
-		t.Fatalf("expected governance.ApplyProposals to reject proposal with stale state root")
+		t.Fatalf("expected proposal application with stale state root to be rejected, got nil error")
+	}
+}
+
+func TestGovernanceApplyFailsWhenSnapshotFails(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	prop := &compiler.Proposal{
+		ID:            "prop_snap_fail",
+		Operation:     compiler.OpCreate,
+		ProposedState: "New memory",
+	}
+
+	// Break snapshot dir by creating a file where snapshots dir should be
+	snapDir := cfg.SnapshotsDir
+	_ = os.RemoveAll(snapDir)
+	_ = os.WriteFile(snapDir, []byte("NOT A DIRECTORY"), 0600)
+
+	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{prop})
+	if err == nil {
+		t.Fatalf("expected ApplyProposals to FAIL CLOSED when snapshot creation fails, got nil error")
+	}
+
+	if len(v.ListEntities()) != 0 {
+		t.Fatalf("state was mutated despite snapshot failure!")
 	}
 }

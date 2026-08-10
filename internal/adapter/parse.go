@@ -190,8 +190,15 @@ func ParseAgentDef(filePath string, content string) (*model.AgentDef, error) {
 	}, nil
 }
 
-// ParseSkillPackage parses a skill package directory or SKILL.md file.
+// ParseSkillPackage parses a skill package directory or SKILL.md file with strict security checks.
 func ParseSkillPackage(filePath string, content string) (*model.SkillPackage, error) {
+	if res := security.InspectFileName(filePath); res.Decision == security.DecisionReject {
+		return nil, fmt.Errorf("%w: skill file %s (%s)", security.ErrDisallowedFile, filePath, res.Reason)
+	}
+	if hasSecret, reason := security.ScanContentForSecrets(content); hasSecret {
+		return nil, fmt.Errorf("%w: skill content %s (%s)", security.ErrSecretDetected, filePath, reason)
+	}
+
 	name := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filepath.Base(filePath)))
 	if name == "SKILL" || name == "skill" {
 		dir := filepath.Dir(filePath)
@@ -233,27 +240,40 @@ func ParseSkillPackage(filePath string, content string) (*model.SkillPackage, er
 
 	skillDir := filepath.Dir(filePath)
 	if info, err := os.Stat(skillDir); err == nil && info.IsDir() {
-		_ = filepath.Walk(skillDir, func(path string, info os.FileInfo, err error) error {
+		walkErr := filepath.Walk(skillDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info.IsDir() || path == filePath {
 				return nil
 			}
 			rel, _ := filepath.Rel(skillDir, path)
 			relSlash := filepath.ToSlash(rel)
+
+			if res := security.InspectFileName(relSlash); res.Decision == security.DecisionReject {
+				return fmt.Errorf("%w: skill subfile %s (%s)", security.ErrDisallowedFile, relSlash, res.Reason)
+			}
+
 			data, readErr := os.ReadFile(path)
 			if readErr != nil {
 				return nil
 			}
 
+			subContent := string(data)
+			if hasSecret, reason := security.ScanContentForSecrets(subContent); hasSecret {
+				return fmt.Errorf("%w: skill subfile content %s (%s)", security.ErrSecretDetected, relSlash, reason)
+			}
+
 			if strings.HasPrefix(relSlash, "scripts/") {
-				scripts[relSlash] = string(data)
+				scripts[relSlash] = subContent
 				hasExec = true
 			} else if strings.HasPrefix(relSlash, "references/") {
-				references[relSlash] = string(data)
+				references[relSlash] = subContent
 			} else {
-				assets[relSlash] = string(data)
+				assets[relSlash] = subContent
 			}
 			return nil
 		})
+		if walkErr != nil {
+			return nil, walkErr
+		}
 	}
 
 	return &model.SkillPackage{

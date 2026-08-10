@@ -17,8 +17,6 @@ type TokenBudget struct {
 	PreferencesCap    int `json:"preferences_cap"`
 	ProjectContextCap int `json:"project_context_cap"`
 	MemoryCap         int `json:"memory_cap"`
-	HistoryCap        int `json:"history_cap"`
-	ReserveCap        int `json:"reserve_cap"`
 }
 
 func DefaultTokenBudget() *TokenBudget {
@@ -28,8 +26,6 @@ func DefaultTokenBudget() *TokenBudget {
 		PreferencesCap:    2000,
 		ProjectContextCap: 3000,
 		MemoryCap:         3000,
-		HistoryCap:        1000,
-		ReserveCap:        1000,
 	}
 }
 

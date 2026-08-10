@@ -298,3 +298,78 @@ func TestReimportIdempotency(t *testing.T) {
 		t.Errorf("expected revision hash to change after modifying content, got identical hash: %s", initialHash)
 	}
 }
+
+func TestSkillEnvFileRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	skillDir := filepath.Join(tempDir, "skills", "env_skill")
+	_ = os.MkdirAll(skillDir, 0700)
+
+	skillMDPath := filepath.Join(skillDir, "SKILL.md")
+	_ = os.WriteFile(skillMDPath, []byte("---\nname: env-skill\ndescription: test env skill\n---\nBody text"), 0600)
+	_ = os.WriteFile(filepath.Join(skillDir, ".env"), []byte("API_SECRET=supersecret123"), 0600)
+
+	_, err := adapter.ParseSkillPackage(skillMDPath, "---\nname: env-skill\ndescription: test env skill\n---\nBody text")
+	if err == nil {
+		t.Fatalf("expected ParseSkillPackage to reject skill package containing .env file")
+	}
+}
+
+func TestSkillReferenceSecretRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	skillDir := filepath.Join(tempDir, "skills", "ref_secret_skill")
+	refDir := filepath.Join(skillDir, "references")
+	_ = os.MkdirAll(refDir, 0700)
+
+	skillMDPath := filepath.Join(skillDir, "SKILL.md")
+	_ = os.WriteFile(skillMDPath, []byte("---\nname: ref-secret-skill\ndescription: test ref secret\n---\nBody text"), 0600)
+	_ = os.WriteFile(filepath.Join(refDir, "ref.md"), []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA=\n-----END OPENSSH PRIVATE KEY-----"), 0600)
+
+	_, err := adapter.ParseSkillPackage(skillMDPath, "---\nname: ref-secret-skill\ndescription: test ref secret\n---\nBody text")
+	if err == nil {
+		t.Fatalf("expected ParseSkillPackage to reject skill package containing secret in references/")
+	}
+}
+
+func TestSkillAssetSecretRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	skillDir := filepath.Join(tempDir, "skills", "asset_secret_skill")
+	assetDir := filepath.Join(skillDir, "assets")
+	_ = os.MkdirAll(assetDir, 0700)
+
+	skillMDPath := filepath.Join(skillDir, "SKILL.md")
+	_ = os.WriteFile(skillMDPath, []byte("---\nname: asset-secret-skill\ndescription: test asset secret\n---\nBody text"), 0600)
+	_ = os.WriteFile(filepath.Join(assetDir, "token.txt"), []byte("ghp_1234567890abcdefghijklmnopqrstuvwxyz"), 0600)
+
+	_, err := adapter.ParseSkillPackage(skillMDPath, "---\nname: asset-secret-skill\ndescription: test asset secret\n---\nBody text")
+	if err == nil {
+		t.Fatalf("expected ParseSkillPackage to reject skill package containing secret in assets/")
+	}
+}
+
+func TestSkillScriptsNeverExecuted(t *testing.T) {
+	tempDir := t.TempDir()
+	skillDir := filepath.Join(tempDir, "skills", "exec_skill")
+	scriptsDir := filepath.Join(skillDir, "scripts")
+	_ = os.MkdirAll(scriptsDir, 0700)
+
+	canaryFile := filepath.Join(tempDir, "canary.txt")
+	scriptContent := "#!/bin/sh\ntouch " + canaryFile + "\n"
+
+	skillMDPath := filepath.Join(skillDir, "SKILL.md")
+	_ = os.WriteFile(skillMDPath, []byte("---\nname: exec-skill\ndescription: test exec script\n---\nBody text"), 0600)
+	_ = os.WriteFile(filepath.Join(scriptsDir, "run.sh"), []byte(scriptContent), 0755)
+
+	pkg, err := adapter.ParseSkillPackage(skillMDPath, "---\nname: exec-skill\ndescription: test exec script\n---\nBody text")
+	if err != nil {
+		t.Fatalf("ParseSkillPackage failed: %v", err)
+	}
+
+	if !pkg.HasExecutables {
+		t.Errorf("expected HasExecutables to be true")
+	}
+
+	// Verify canary file was NEVER created (scripts are parsed as data, NEVER executed)
+	if _, err := os.Stat(canaryFile); !os.IsNotExist(err) {
+		t.Fatalf("SECURITY VIOLATION: skill script was executed during parsing!")
+	}
+}

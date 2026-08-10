@@ -85,10 +85,10 @@ func Initialize(cfg *config.Config) (*Vault, error) {
 	if _, statErr := os.Stat(vaultMetaPath); os.IsNotExist(statErr) {
 		vaultMeta = &VaultMetadata{
 			VaultID:       GenerateID("apv"),
-			SchemaVersion: model.SchemaVersionV1,
+			SchemaVersion: model.SchemaVersionV2,
 			CreatedAt:     time.Now(),
 			Recipient:     kp.Recipient.String(),
-			FormatVersion: "1",
+			FormatVersion: "2",
 		}
 		data, err := json.MarshalIndent(vaultMeta, "", "  ")
 		if err != nil {

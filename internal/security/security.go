@@ -151,12 +151,34 @@ func ValidateEnvelopeSecurity(env *model.EnvelopeV2) error {
 	}
 
 	if env.Skill != nil {
+		if res := InspectFileName("SKILL.md"); res.Decision == DecisionReject {
+			return fmt.Errorf("%w: skill md (%s)", ErrDisallowedFile, res.Reason)
+		}
 		if hasSecret, reason := ScanContentForSecrets(env.Skill.SkillMD); hasSecret {
 			return fmt.Errorf("%w: skill md (%s)", ErrSecretDetected, reason)
 		}
 		for sName, sContent := range env.Skill.Scripts {
+			if res := InspectFileName(sName); res.Decision == DecisionReject {
+				return fmt.Errorf("%w: script %s (%s)", ErrDisallowedFile, sName, res.Reason)
+			}
 			if hasSecret, reason := ScanContentForSecrets(sContent); hasSecret {
 				return fmt.Errorf("%w: script %s (%s)", ErrSecretDetected, sName, reason)
+			}
+		}
+		for rName, rContent := range env.Skill.References {
+			if res := InspectFileName(rName); res.Decision == DecisionReject {
+				return fmt.Errorf("%w: reference %s (%s)", ErrDisallowedFile, rName, res.Reason)
+			}
+			if hasSecret, reason := ScanContentForSecrets(rContent); hasSecret {
+				return fmt.Errorf("%w: reference %s (%s)", ErrSecretDetected, rName, reason)
+			}
+		}
+		for aName, aContent := range env.Skill.Assets {
+			if res := InspectFileName(aName); res.Decision == DecisionReject {
+				return fmt.Errorf("%w: asset %s (%s)", ErrDisallowedFile, aName, res.Reason)
+			}
+			if hasSecret, reason := ScanContentForSecrets(aContent); hasSecret {
+				return fmt.Errorf("%w: asset %s (%s)", ErrSecretDetected, aName, reason)
 			}
 		}
 	}

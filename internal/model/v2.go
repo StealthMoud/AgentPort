@@ -488,4 +488,3 @@ func ComputeV2StateRoot(entities []*EnvelopeV2) string {
 
 	return ComputeFingerprint(KindMemory, ScopeGlobal, "vault_v2_state_root", total, nil)
 }
-

@@ -80,28 +80,68 @@ func (tx *Tx) SaveEntity(env *model.EnvelopeV2) error {
 		return fmt.Errorf("transaction already finished")
 	}
 
-	if env.SchemaVersion == "" {
-		env.SchemaVersion = model.SchemaVersionV2
+	cloned := env.Clone()
+	if cloned.SchemaVersion == "" {
+		cloned.SchemaVersion = model.SchemaVersionV2
 	}
-	if env.Revision < 1 {
-		env.Revision = 1
+	if cloned.Revision < 1 {
+		cloned.Revision = 1
+	}
+	if cloned.RevisionHash == "" {
+		cloned.RevisionHash = model.ComputeRevisionHash(cloned)
 	}
 
-	if err := env.Validate(); err != nil {
+	if err := cloned.Validate(); err != nil {
 		return err
 	}
 
-	if err := security.ValidateEnvelopeSecurity(env); err != nil {
+	if err := security.ValidateEnvelopeSecurity(cloned); err != nil {
 		return err
 	}
 
-	if env.CreatedAt.IsZero() {
-		env.CreatedAt = time.Now()
+	if cloned.CreatedAt.IsZero() {
+		cloned.CreatedAt = time.Now()
 	}
-	env.UpdatedAt = time.Now()
+	cloned.UpdatedAt = time.Now()
 
-	tx.stagedEntities[env.ID] = env
-	delete(tx.deletions, env.ID)
+	tx.stagedEntities[cloned.ID] = cloned
+	delete(tx.deletions, cloned.ID)
+	return nil
+}
+
+// UpdateEntity stages an update to an existing V2 envelope, preserving ID, incrementing Revision (N -> N+1), and updating RevisionHash.
+func (tx *Tx) UpdateEntity(env *model.EnvelopeV2) error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+
+	if tx.committed || tx.rolledBack {
+		return fmt.Errorf("transaction already finished")
+	}
+
+	existing, inStaged := tx.stagedEntities[env.ID]
+	if !inStaged {
+		var exists bool
+		existing, exists = tx.v.GetEntity(env.ID)
+		if !exists {
+			return fmt.Errorf("entity %s not found for update", env.ID)
+		}
+	}
+
+	cloned := env.Clone()
+	cloned.Revision = existing.Revision + 1
+	cloned.UpdatedAt = time.Now()
+	cloned.RevisionHash = model.ComputeRevisionHash(cloned)
+
+	if err := cloned.Validate(); err != nil {
+		return err
+	}
+
+	if err := security.ValidateEnvelopeSecurity(cloned); err != nil {
+		return err
+	}
+
+	tx.stagedEntities[cloned.ID] = cloned
+	delete(tx.deletions, cloned.ID)
 	return nil
 }
 
@@ -171,15 +211,22 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 
 	stagingDir := filepath.Join(tx.v.cfg.VaultDir, fmt.Sprintf(".staged_%d", time.Now().UnixNano()))
 	stagedArtifactsDir := filepath.Join(stagingDir, "artifacts")
+	stagedTombstonesDir := filepath.Join(stagingDir, "tombstones")
+
 	if err := os.MkdirAll(stagedArtifactsDir, 0700); err != nil {
-		return fmt.Errorf("failed creating staging directory: %w", err)
+		return fmt.Errorf("failed creating staging artifacts directory: %w", err)
+	}
+	if err := os.MkdirAll(stagedTombstonesDir, 0700); err != nil {
+		return fmt.Errorf("failed creating staging tombstones directory: %w", err)
 	}
 	defer func() {
 		_ = os.RemoveAll(stagingDir)
 	}()
 
 	realArtifactsDir := filepath.Join(tx.v.cfg.VaultDir, "artifacts")
+	realTombstonesDir := filepath.Join(tx.v.cfg.VaultDir, "tombstones")
 	_ = os.MkdirAll(realArtifactsDir, 0700)
+	_ = os.MkdirAll(realTombstonesDir, 0700)
 
 	// Copy existing real artifacts/entities to staging directory
 	existingEntries, _ := os.ReadDir(realArtifactsDir)
@@ -195,6 +242,20 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		}
 		if err := os.WriteFile(dstPath, data, 0600); err != nil {
 			return fmt.Errorf("failed copying existing artifact to staging: %w", err)
+		}
+	}
+
+	// Copy existing real tombstones to staging directory
+	existingTombs, _ := os.ReadDir(realTombstonesDir)
+	for _, entry := range existingTombs {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		srcPath := filepath.Join(realTombstonesDir, entry.Name())
+		dstPath := filepath.Join(stagedTombstonesDir, entry.Name())
+		data, err := os.ReadFile(srcPath)
+		if err == nil {
+			_ = os.WriteFile(dstPath, data, 0600)
 		}
 	}
 
@@ -244,9 +305,7 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		}
 	}
 
-	tombDir := filepath.Join(tx.v.cfg.VaultDir, "tombstones")
-
-	// Apply staged deletions to staging directory & record tombstones
+	// Apply staged deletions to staging directory & record tombstones in STAGED tombstones dir
 	for id := range tx.deletions {
 		if hook != nil {
 			if err := hook("during_delete"); err != nil {
@@ -267,7 +326,6 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		}
 
 		if prevHash != "" {
-			_ = os.MkdirAll(tombDir, 0700)
 			ts := &model.Tombstone{
 				EntityID:             id,
 				DeletedRevision:      delRev,
@@ -276,7 +334,7 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 				PreviousRevisionHash: prevHash,
 			}
 			data, _ := json.MarshalIndent(ts, "", "  ")
-			_ = fsutil.WriteFileAtomic(filepath.Join(tombDir, id+".json"), data, 0600)
+			_ = fsutil.WriteFileAtomic(filepath.Join(stagedTombstonesDir, id+".json"), data, 0600)
 		}
 	}
 
@@ -289,29 +347,43 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		}
 	}
 
-	// Whole-directory atomic swap: rename realArtifactsDir -> backupDir, move stagedArtifactsDir -> realArtifactsDir
-	backupDir := filepath.Join(tx.v.cfg.VaultDir, fmt.Sprintf("artifacts_backup_%d", time.Now().UnixNano()))
+	// Whole-directory atomic swap for artifacts AND tombstones
+	backupArtifactsDir := filepath.Join(tx.v.cfg.VaultDir, fmt.Sprintf("artifacts_backup_%d", time.Now().UnixNano()))
+	backupTombstonesDir := filepath.Join(tx.v.cfg.VaultDir, fmt.Sprintf("tombstones_backup_%d", time.Now().UnixNano()))
 
-	if err := os.Rename(realArtifactsDir, backupDir); err != nil {
-		_, _ = fsutil.BackupFile(realArtifactsDir, backupDir)
+	if err := os.Rename(realArtifactsDir, backupArtifactsDir); err != nil {
+		_, _ = fsutil.BackupFile(realArtifactsDir, backupArtifactsDir)
+	}
+	if err := os.Rename(realTombstonesDir, backupTombstonesDir); err != nil {
+		_, _ = fsutil.BackupFile(realTombstonesDir, backupTombstonesDir)
 	}
 
 	if hook != nil {
 		if err := hook("after_backup_rename"); err != nil {
-			_ = os.Rename(backupDir, realArtifactsDir)
+			_ = os.Rename(backupArtifactsDir, realArtifactsDir)
+			_ = os.Rename(backupTombstonesDir, realTombstonesDir)
 			return fmt.Errorf("injected fault after_backup_rename: %w", err)
 		}
 	}
 
 	if err := os.Rename(stagedArtifactsDir, realArtifactsDir); err != nil {
-		_ = os.Rename(backupDir, realArtifactsDir)
-		return fmt.Errorf("failed atomic directory swap: %w", err)
+		_ = os.Rename(backupArtifactsDir, realArtifactsDir)
+		_ = os.Rename(backupTombstonesDir, realTombstonesDir)
+		return fmt.Errorf("failed atomic artifacts directory swap: %w", err)
+	}
+	if err := os.Rename(stagedTombstonesDir, realTombstonesDir); err != nil {
+		_ = os.RemoveAll(realArtifactsDir)
+		_ = os.Rename(backupArtifactsDir, realArtifactsDir)
+		_ = os.Rename(backupTombstonesDir, realTombstonesDir)
+		return fmt.Errorf("failed atomic tombstones directory swap: %w", err)
 	}
 
 	if hook != nil {
 		if err := hook("during_final_swap"); err != nil {
 			_ = os.RemoveAll(realArtifactsDir)
-			_ = os.Rename(backupDir, realArtifactsDir)
+			_ = os.RemoveAll(realTombstonesDir)
+			_ = os.Rename(backupArtifactsDir, realArtifactsDir)
+			_ = os.Rename(backupTombstonesDir, realTombstonesDir)
 			return fmt.Errorf("injected fault during_final_swap: %w", err)
 		}
 	}
@@ -320,7 +392,9 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		if err := hook("post_swap_pre_inmemory"); err != nil {
 			// Rollback disk swap so disk and in-memory stay in sync (OLD state)
 			_ = os.RemoveAll(realArtifactsDir)
-			_ = os.Rename(backupDir, realArtifactsDir)
+			_ = os.RemoveAll(realTombstonesDir)
+			_ = os.Rename(backupArtifactsDir, realArtifactsDir)
+			_ = os.Rename(backupTombstonesDir, realTombstonesDir)
 			return fmt.Errorf("injected fault post_swap_pre_inmemory: %w", err)
 		}
 	}
@@ -337,7 +411,8 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		delete(tx.v.entities, id)
 	}
 
-	_ = os.RemoveAll(backupDir)
+	_ = os.RemoveAll(backupArtifactsDir)
+	_ = os.RemoveAll(backupTombstonesDir)
 
 	tx.committed = true
 	return nil
