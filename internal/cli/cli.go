@@ -18,12 +18,14 @@ import (
 	"github.com/StealthMoud/AgentPort/internal/config"
 	contextpkg "github.com/StealthMoud/AgentPort/internal/context"
 	"github.com/StealthMoud/AgentPort/internal/crypt"
+	"github.com/StealthMoud/AgentPort/internal/device"
 	"github.com/StealthMoud/AgentPort/internal/gitstore"
 	"github.com/StealthMoud/AgentPort/internal/governance"
 	"github.com/StealthMoud/AgentPort/internal/model"
 	"github.com/StealthMoud/AgentPort/internal/optimizer"
 	"github.com/StealthMoud/AgentPort/internal/reconcile"
 	"github.com/StealthMoud/AgentPort/internal/snapshot"
+	"github.com/StealthMoud/AgentPort/internal/syncv2"
 	"github.com/StealthMoud/AgentPort/internal/vault"
 	"github.com/StealthMoud/AgentPort/internal/version"
 )
@@ -57,6 +59,12 @@ portable across machines, operating systems, and AI coding agents.`,
 	rootCmd.AddCommand(newRemoteCmd())
 	rootCmd.AddCommand(newSyncCmd())
 	rootCmd.AddCommand(newKeyCmd())
+	rootCmd.AddCommand(newJoinCmd())
+	rootCmd.AddCommand(newDeviceCmd())
+	rootCmd.AddCommand(newRecoveryCmd())
+	rootCmd.AddCommand(newRecoverCmd())
+	rootCmd.AddCommand(newConflictsCmd())
+	rootCmd.AddCommand(newProtocolCmd())
 
 	return rootCmd
 }
@@ -168,6 +176,20 @@ func newDoctorCmd() *cobra.Command {
 				fmt.Println("○ Vault not initialized (run 'agentport init')")
 			}
 
+			// Device keys check
+			if devKeys, err := device.LoadDeviceKeys(cfg); err == nil && devKeys.DeviceID != "" {
+				fmt.Printf("✓ Device keys available (ID: %s)\n", devKeys.DeviceID)
+			} else {
+				fmt.Println("○ Device keys not loaded (run 'agentport protocol migrate' or 'agentport join')")
+			}
+
+			// Offline recovery authority check
+			if recip, _, _, err := device.LoadRecoveryPublicConfig(cfg); err == nil && recip != "" {
+				fmt.Println("✓ Offline recovery authority configured")
+			} else {
+				fmt.Println("○ Offline recovery authority not configured (run 'agentport recovery export')")
+			}
+
 			// Provider detection
 			adapters := getAdapters()
 			for name, ad := range adapters {
@@ -223,16 +245,36 @@ func newStatusCmd() *cobra.Command {
 				stateRoot = compiler.ComputeStateRoot(artifacts)
 			}
 
+			protoStatus, _ := syncv2.CheckMigrationStatus(cfg)
+			devKeys, _ := device.LoadDeviceKeys(cfg)
+			recip, _, _, _ := device.LoadRecoveryPublicConfig(cfg)
+
+			devID := ""
+			if devKeys != nil {
+				devID = devKeys.DeviceID
+			}
+
+			protoVersion := "1.0"
+			epochNum := uint64(0)
+			if protoStatus != nil && protoStatus.AlreadyMigrated {
+				protoVersion = "2.0"
+				epochNum = protoStatus.RegistryEpoch
+			}
+
 			if jsonOutput {
 				statusObj := map[string]interface{}{
-					"vault_id":        v.Metadata.VaultID,
-					"schema_version":  v.Metadata.SchemaVersion,
-					"entity_count":    len(entities),
-					"artifact_count":  len(artifacts),
-					"tombstone_count": tombstoneCount,
-					"state_root":      stateRoot,
-					"remote_url":      remoteURL,
-					"machine_id":      v.Machine.MachineID,
+					"vault_id":            v.Metadata.VaultID,
+					"protocol_version":    protoVersion,
+					"device_id":           devID,
+					"registry_epoch":      epochNum,
+					"recovery_configured": recip != "",
+					"schema_version":      v.Metadata.SchemaVersion,
+					"entity_count":        len(entities),
+					"artifact_count":      len(artifacts),
+					"tombstone_count":     tombstoneCount,
+					"state_root":          stateRoot,
+					"remote_url":          remoteURL,
+					"machine_id":          v.Machine.MachineID,
 				}
 				data, _ := json.MarshalIndent(statusObj, "", "  ")
 				fmt.Println(string(data))
@@ -241,7 +283,14 @@ func newStatusCmd() *cobra.Command {
 
 			fmt.Println("AgentPort Status")
 			fmt.Println()
+			fmt.Printf("Protocol:     %s\n", protoVersion)
 			fmt.Printf("Vault:        %s\n", v.Metadata.VaultID)
+			if devID != "" {
+				fmt.Printf("Device ID:    %s\n", devID)
+			}
+			if epochNum > 0 {
+				fmt.Printf("Epoch:        %d\n", epochNum)
+			}
 			fmt.Printf("Schema:       %s\n", v.Metadata.SchemaVersion)
 			fmt.Printf("V2 Entities:  %d\n", len(entities))
 			fmt.Printf("V1 Artifacts: %d\n", len(artifacts))
@@ -253,7 +302,7 @@ func newStatusCmd() *cobra.Command {
 			} else {
 				fmt.Printf("Git Remote:   not configured\n")
 			}
-			fmt.Printf("Encryption:   enabled (Age X25519)\n")
+			fmt.Printf("Encryption:   enabled (Age X25519 + Ed25519)\n")
 			return nil
 		},
 	}
