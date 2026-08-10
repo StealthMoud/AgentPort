@@ -12,7 +12,8 @@ import (
 )
 
 type MemoryCompiler struct {
-	backend Backend
+	backend            Backend
+	allowPrivateRemote bool
 }
 
 func NewMemoryCompiler(b Backend) *MemoryCompiler {
@@ -20,6 +21,10 @@ func NewMemoryCompiler(b Backend) *MemoryCompiler {
 		b = NewTestBackend()
 	}
 	return &MemoryCompiler{backend: b}
+}
+
+func (mc *MemoryCompiler) SetAllowPrivateRemote(allow bool) {
+	mc.allowPrivateRemote = allow
 }
 
 // ComputeStateRoot calculates deterministic SHA-256 state root for vault artifacts.
@@ -37,6 +42,11 @@ func ComputeStateRoot(artifacts []*model.Artifact) string {
 	}
 
 	return model.ComputeFingerprint(model.KindMemory, model.ScopeGlobal, "vault_state_root", totalFingerprints, nil)
+}
+
+// ComputeV2StateRoot calculates state root for V2 entities.
+func ComputeV2StateRoot(entities []*model.EnvelopeV2) string {
+	return model.ComputeV2StateRoot(entities)
 }
 
 // ValidateProposal performs strict untrusted model output validation.
@@ -81,13 +91,19 @@ func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope mod
 		return nil, fmt.Errorf("memory compiler backend health check failed: %w", err)
 	}
 
+	isRemoteBackend := mc.backend.Name() == "openai" || mc.backend.Name() == "anthropic" || mc.backend.Name() == "gemini"
+
 	artifacts := v.ListArtifacts()
 	filtered := make([]*model.Artifact, 0, len(artifacts))
 	validIDs := make(map[string]bool)
 
 	for _, art := range artifacts {
-		// Privacy policy enforcement: SensitivitySecret is NEVER sent to any model backend
+		// SensitivitySecret is NEVER sent to any model backend
 		if art.Sensitivity == model.SensitivitySecret {
+			continue
+		}
+		// SensitivityPrivate requires explicit opt-in for remote backends
+		if art.Sensitivity == model.SensitivityPrivate && isRemoteBackend && !mc.allowPrivateRemote {
 			continue
 		}
 		if scope != "" && art.Scope != scope {
@@ -102,7 +118,12 @@ func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope mod
 	entities := v.ListEntities()
 	filteredEntities := make([]*model.EnvelopeV2, 0, len(entities))
 	for _, env := range entities {
+		// SensitivitySecret is NEVER sent to any model backend
 		if env.Sensitivity == model.SensitivitySecret {
+			continue
+		}
+		// SensitivityPrivate requires explicit opt-in for remote backends
+		if env.Sensitivity == model.SensitivityPrivate && isRemoteBackend && !mc.allowPrivateRemote {
 			continue
 		}
 		if scope != "" && env.Scope != scope {
@@ -112,7 +133,10 @@ func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope mod
 		validIDs[env.ID] = true
 	}
 
-	stateRoot := ComputeStateRoot(filtered)
+	stateRoot := model.ComputeV2StateRoot(entities)
+	if len(entities) == 0 {
+		stateRoot = ComputeStateRoot(filtered)
+	}
 
 	req := &AnalysisRequest{
 		Scope:          scope,

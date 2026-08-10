@@ -215,46 +215,50 @@ func (v *Vault) SaveEntity(env *model.EnvelopeV2) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if env.SchemaVersion == "" {
-		env.SchemaVersion = model.SchemaVersionV2
+	cloned := env.Clone()
+	if cloned.SchemaVersion == "" {
+		cloned.SchemaVersion = model.SchemaVersionV2
 	}
-	if env.Revision < 1 {
-		env.Revision = 1
+	if cloned.Revision < 1 {
+		cloned.Revision = 1
+	}
+	if cloned.RevisionHash == "" {
+		cloned.RevisionHash = model.ComputeRevisionHash(cloned)
 	}
 
-	if err := env.Validate(); err != nil {
+	if err := cloned.Validate(); err != nil {
 		return err
 	}
 
-	if err := security.ValidateEnvelopeSecurity(env); err != nil {
+	if err := security.ValidateEnvelopeSecurity(cloned); err != nil {
 		return err
 	}
 
-	if env.CreatedAt.IsZero() {
-		env.CreatedAt = time.Now()
+	if cloned.CreatedAt.IsZero() {
+		cloned.CreatedAt = time.Now()
 	}
-	env.UpdatedAt = time.Now()
+	cloned.UpdatedAt = time.Now()
 
 	artifactsDir := filepath.Join(v.cfg.VaultDir, "artifacts")
 	if err := os.MkdirAll(artifactsDir, 0700); err != nil {
 		return err
 	}
 
-	data, err := json.MarshalIndent(env, "", "  ")
+	data, err := json.MarshalIndent(cloned, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	artPath := filepath.Join(artifactsDir, env.ID+".json")
+	artPath := filepath.Join(artifactsDir, cloned.ID+".json")
 	if err := fsutil.WriteFileAtomic(artPath, data, 0600); err != nil {
 		return err
 	}
 
-	v.entities[env.ID] = env
+	v.entities[cloned.ID] = cloned
 	return nil
 }
 
-// GetEntity retrieves a V2 envelope by ID.
+// GetEntity retrieves a deep copy of a V2 envelope by ID.
 func (v *Vault) GetEntity(id string) (*model.EnvelopeV2, bool) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -263,17 +267,17 @@ func (v *Vault) GetEntity(id string) (*model.EnvelopeV2, bool) {
 	if !exists {
 		return nil, false
 	}
-	return env, true
+	return env.Clone(), true
 }
 
-// ListEntities returns a slice of all current V2 envelopes.
+// ListEntities returns a slice of deep copies of all current V2 envelopes.
 func (v *Vault) ListEntities() []*model.EnvelopeV2 {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
 	res := make([]*model.EnvelopeV2, 0, len(v.entities))
 	for _, env := range v.entities {
-		res = append(res, env)
+		res = append(res, env.Clone())
 	}
 	return res
 }
@@ -284,19 +288,22 @@ func (v *Vault) DeleteEntity(id string) error {
 	defer v.mu.Unlock()
 
 	var prevHash string
+	delRev := 1
 	if env, ok := v.entities[id]; ok {
 		prevHash = env.RevisionHash
+		delRev = env.Revision
 	}
 
 	artPath := filepath.Join(v.cfg.VaultDir, "artifacts", id+".json")
 	_ = os.Remove(artPath)
 	delete(v.entities, id)
+	delete(v.artifacts, id)
 
 	tombDir := filepath.Join(v.cfg.VaultDir, "tombstones")
 	_ = os.MkdirAll(tombDir, 0700)
 	ts := &model.Tombstone{
 		EntityID:             id,
-		DeletedRevision:      1,
+		DeletedRevision:      delRev,
 		DeletedAt:            time.Now(),
 		OriginMachineID:      v.Machine.MachineID,
 		PreviousRevisionHash: prevHash,
@@ -307,7 +314,26 @@ func (v *Vault) DeleteEntity(id string) error {
 	return nil
 }
 
-// UpdateEntity updates an existing V2 envelope, preserving entity ID and incrementing Revision (N -> N+1).
+// ApplyRemoteTombstone applies a remote tombstone directly without loop replication.
+func (v *Vault) ApplyRemoteTombstone(ts *model.Tombstone) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	artPath := filepath.Join(v.cfg.VaultDir, "artifacts", ts.EntityID+".json")
+	_ = os.Remove(artPath)
+	delete(v.entities, ts.EntityID)
+	delete(v.artifacts, ts.EntityID)
+
+	tombDir := filepath.Join(v.cfg.VaultDir, "tombstones")
+	_ = os.MkdirAll(tombDir, 0700)
+	data, err := json.MarshalIndent(ts, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.WriteFileAtomic(filepath.Join(tombDir, ts.EntityID+".json"), data, 0600)
+}
+
+// UpdateEntity updates an existing V2 envelope, preserving entity ID, incrementing Revision (N -> N+1), and recomputing RevisionHash.
 func (v *Vault) UpdateEntity(env *model.EnvelopeV2) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -317,29 +343,31 @@ func (v *Vault) UpdateEntity(env *model.EnvelopeV2) error {
 		return fmt.Errorf("entity %s not found for update", env.ID)
 	}
 
-	env.Revision = existing.Revision + 1
-	env.UpdatedAt = time.Now()
+	cloned := env.Clone()
+	cloned.Revision = existing.Revision + 1
+	cloned.UpdatedAt = time.Now()
+	cloned.RevisionHash = model.ComputeRevisionHash(cloned)
 
-	if err := env.Validate(); err != nil {
+	if err := cloned.Validate(); err != nil {
 		return err
 	}
 
-	if err := security.ValidateEnvelopeSecurity(env); err != nil {
+	if err := security.ValidateEnvelopeSecurity(cloned); err != nil {
 		return err
 	}
 
 	artifactsDir := filepath.Join(v.cfg.VaultDir, "artifacts")
-	data, err := json.MarshalIndent(env, "", "  ")
+	data, err := json.MarshalIndent(cloned, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	artPath := filepath.Join(artifactsDir, env.ID+".json")
+	artPath := filepath.Join(artifactsDir, cloned.ID+".json")
 	if err := fsutil.WriteFileAtomic(artPath, data, 0600); err != nil {
 		return err
 	}
 
-	v.entities[env.ID] = env
+	v.entities[cloned.ID] = cloned
 	return nil
 }
 
@@ -433,6 +461,7 @@ func (v *Vault) DeleteArtifact(id string) error {
 	artPath := filepath.Join(v.cfg.VaultDir, "artifacts", id+".json")
 	_ = os.Remove(artPath)
 	delete(v.artifacts, id)
+	delete(v.entities, id)
 
 	tombDir := filepath.Join(v.cfg.VaultDir, "tombstones")
 	_ = os.MkdirAll(tombDir, 0700)

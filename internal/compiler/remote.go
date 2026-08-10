@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 )
@@ -13,6 +14,8 @@ const (
 	RemoteProviderAnthropic RemoteProvider = "anthropic"
 	RemoteProviderGemini    RemoteProvider = "gemini"
 )
+
+var ErrBackendNotImplemented = errors.New("remote backend is not implemented")
 
 type RemoteBackend struct {
 	provider   RemoteProvider
@@ -55,11 +58,5 @@ func (b *RemoteBackend) Analyze(ctx context.Context, req *AnalysisRequest) (*Ana
 		return nil, err
 	}
 
-	// Remote backend delegate implementation returning structured validation wrapper
-	return &AnalysisResponse{
-		Proposals: []*Proposal{},
-		Metrics: &Metrics{
-			AnalyzedCount: len(req.Artifacts),
-		},
-	}, nil
+	return nil, fmt.Errorf("%w: provider %s is explicitly unsupported/unimplemented in Phase 0.5-5 baseline", ErrBackendNotImplemented, b.provider)
 }

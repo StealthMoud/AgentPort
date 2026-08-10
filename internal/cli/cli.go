@@ -213,13 +213,20 @@ func newStatusCmd() *cobra.Command {
 			store := gitstore.New(cfg)
 			remoteURL, _ := store.GetRemote(ctx)
 
+			entities := v.ListEntities()
 			artifacts := v.ListArtifacts()
+			stateRoot := model.ComputeV2StateRoot(entities)
+			if len(entities) == 0 {
+				stateRoot = compiler.ComputeStateRoot(artifacts)
+			}
 
 			if jsonOutput {
 				statusObj := map[string]interface{}{
 					"vault_id":       v.Metadata.VaultID,
 					"schema_version": v.Metadata.SchemaVersion,
+					"entity_count":   len(entities),
 					"artifact_count": len(artifacts),
+					"state_root":     stateRoot,
 					"remote_url":     remoteURL,
 					"machine_id":     v.Machine.MachineID,
 				}
@@ -232,7 +239,9 @@ func newStatusCmd() *cobra.Command {
 			fmt.Println()
 			fmt.Printf("Vault:        %s\n", v.Metadata.VaultID)
 			fmt.Printf("Schema:       %s\n", v.Metadata.SchemaVersion)
-			fmt.Printf("Artifacts:    %d\n", len(artifacts))
+			fmt.Printf("V2 Entities:  %d\n", len(entities))
+			fmt.Printf("V1 Artifacts: %d\n", len(artifacts))
+			fmt.Printf("State Root:   %s\n", stateRoot)
 			fmt.Printf("Machine ID:   %s\n", v.Machine.MachineID)
 			if remoteURL != "" {
 				fmt.Printf("Git Remote:   %s\n", remoteURL)
@@ -398,23 +407,29 @@ func newImportCmd() *cobra.Command {
 				adapters = map[string]adapter.Adapter{providerFlag: ad}
 			}
 
+			opCtx := &adapter.OperationContext{
+				WorkspacePath: workspaceFlag,
+				Scope:         model.ScopeGlobal,
+			}
+			if workspaceFlag != "" {
+				opCtx.Scope = model.ScopeProject
+				opCtx.ProjectID = model.ComputeFingerprint(model.KindProjectContext, model.ScopeProject, workspaceFlag, workspaceFlag, nil)[:16]
+			}
+
 			importedCount := 0
 			for name, ad := range adapters {
-				arts, err := ad.Import(ctx, v.Machine.MachineID)
+				envs, err := ad.ImportV2(ctx, v.Machine.MachineID, opCtx)
 				if err != nil {
 					fmt.Printf("Error importing from %s: %v\n", name, err)
 					continue
 				}
 
-				for _, art := range arts {
-					if workspaceFlag != "" && art.Scope == model.ScopeProject {
-						art.Metadata = map[string]string{"workspace": workspaceFlag}
-					}
-					if err := v.SaveArtifact(art); err == nil {
+				for _, env := range envs {
+					if err := v.SaveEntity(env); err == nil {
 						importedCount++
 					}
 				}
-				fmt.Printf("Imported %d artifacts from %s\n", len(arts), name)
+				fmt.Printf("Imported %d V2 entities from %s\n", len(envs), name)
 			}
 
 			fmt.Println()
@@ -555,8 +570,14 @@ func newExportCmd() *cobra.Command {
 				return err
 			}
 
-			artifacts := v.ListArtifacts()
-			plan, err := ad.PlanExport(ctx, artifacts)
+			b := contextpkg.DefaultTokenBudget()
+			cc := contextpkg.NewContextCompiler(b)
+			manifest, err := cc.Compile(ctx, v, providerFlag, ad.Capabilities())
+			if err != nil {
+				return err
+			}
+
+			plan, err := ad.PlanExportV2(ctx, manifest)
 			if err != nil {
 				return err
 			}
@@ -898,7 +919,7 @@ func newCompileCmd() *cobra.Command {
 
 			fmt.Printf("AgentPort Context Compiler (%s)\n\n", strings.Title(providerFlag))
 			fmt.Printf("State Root: %s\n", manifest.StateRoot)
-			fmt.Printf("Budget:     %d tokens\n", manifest.Budget.MaxTokens)
+			fmt.Printf("Budget:     %d tokens\n", b.MaxTokens)
 			fmt.Printf("Estimated:  %d tokens\n\n", manifest.TotalTokensEst)
 
 			fmt.Println("Included Entities:")
@@ -1045,103 +1066,8 @@ func newMemoryCmd() *cobra.Command {
 				return fmt.Errorf("proposal ID or valid --set flag is required")
 			}
 
-			// 1. Create pre-apply backup snapshot for genuine atomic undo capability
-			snapMgr := snapshot.NewManager(cfg)
-			snap, snapErr := snapMgr.CreateSnapshot(v, "pre_governance_apply")
-			snapID := ""
-			if snapErr == nil {
-				snapID = snap.SnapshotID
-			}
-
-			// 2. Single atomic transaction for all proposals in set
-			tx := v.BeginTx()
-			for _, prop := range targetProps {
-				// State-root safety check
-				currentStateRoot := compiler.ComputeStateRoot(v.ListArtifacts())
-				if prop.InputStateRoot != "" && prop.InputStateRoot != currentStateRoot {
-					_ = tx.Rollback()
-					return fmt.Errorf("stale proposal %s rejected: proposal state root (%s) != current vault state root (%s)", prop.ID, prop.InputStateRoot, currentStateRoot)
-				}
-
-				switch prop.Operation {
-				case compiler.OpCreate:
-					env := &model.EnvelopeV2{
-						ID:            model.GenerateEntityID("apm"),
-						SchemaVersion: model.SchemaVersionV2,
-						Kind:          model.KindMemoryV2,
-						Scope:         model.ScopeGlobal,
-						Memory: &model.MemoryPayload{
-							Statement:  prop.ProposedState,
-							Category:   model.CategoryWorkflow,
-							Status:     model.MemoryStatusActive,
-							Importance: 8,
-							Confidence: prop.Confidence,
-							Derivation: model.DerivationSummarized,
-						},
-					}
-					if err := tx.SaveEntity(env); err != nil {
-						_ = tx.Rollback()
-						return err
-					}
-				case compiler.OpMerge, compiler.OpSupersede:
-					for _, tid := range prop.TargetIDs {
-						_ = tx.DeleteArtifact(tid)
-					}
-					env := &model.EnvelopeV2{
-						ID:            model.GenerateEntityID("apm"),
-						SchemaVersion: model.SchemaVersionV2,
-						Kind:          model.KindMemoryV2,
-						Scope:         model.ScopeGlobal,
-						Memory: &model.MemoryPayload{
-							Statement:  prop.ProposedState,
-							Category:   model.CategoryWorkflow,
-							Status:     model.MemoryStatusActive,
-							Importance: 8,
-							Confidence: prop.Confidence,
-							Derivation: model.DerivationSummarized,
-						},
-					}
-					if err := tx.SaveEntity(env); err != nil {
-						_ = tx.Rollback()
-						return err
-					}
-				case compiler.OpRefine, compiler.OpReclassify:
-					for _, tid := range prop.TargetIDs {
-						if existing, ok := v.GetEntity(tid); ok {
-							existing.Memory.Statement = prop.ProposedState
-							_ = tx.SaveEntity(existing)
-						}
-					}
-				case compiler.OpArchive:
-					for _, tid := range prop.TargetIDs {
-						_ = tx.DeleteArtifact(tid)
-					}
-				case compiler.OpMarkConflict, compiler.OpMarkStale:
-					for _, tid := range prop.TargetIDs {
-						if existing, ok := v.GetEntity(tid); ok {
-							existing.Memory.Status = model.MemoryStatusSuperseded
-							_ = tx.SaveEntity(existing)
-						}
-					}
-				}
-			}
-
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("failed committing proposal set application: %w", err)
-			}
-
-			// Mark proposals accepted and log audit events with snapshot reference
-			j := governance.NewJournal(cfg)
-			for _, prop := range targetProps {
-				prop.Status = compiler.ProposalStatusAccepted
-				_ = ps.SaveProposal(prop)
-				_ = j.RecordEvent(&governance.AuditEvent{
-					Actor:      "memory_compiler",
-					Operation:  string(prop.Operation),
-					ProposalID: prop.ID,
-					TargetID:   prop.ID,
-					SnapshotID: snapID,
-				})
+			if err := governance.ApplyProposals(v, cfg, targetProps); err != nil {
+				return err
 			}
 
 			fmt.Printf("✓ Applied %d proposals successfully!\n", len(targetProps))

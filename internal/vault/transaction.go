@@ -107,6 +107,11 @@ func (tx *Tx) SaveEntity(env *model.EnvelopeV2) error {
 
 // DeleteArtifact stages an artifact deletion in the transaction.
 func (tx *Tx) DeleteArtifact(id string) error {
+	return tx.DeleteEntity(id)
+}
+
+// DeleteEntity stages an entity or artifact deletion in the transaction.
+func (tx *Tx) DeleteEntity(id string) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
 
@@ -239,7 +244,9 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		}
 	}
 
-	// Apply staged deletions to staging directory
+	tombDir := filepath.Join(tx.v.cfg.VaultDir, "tombstones")
+
+	// Apply staged deletions to staging directory & record tombstones
 	for id := range tx.deletions {
 		if hook != nil {
 			if err := hook("during_delete"); err != nil {
@@ -248,6 +255,29 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		}
 		artPath := filepath.Join(stagedArtifactsDir, id+".json")
 		_ = os.Remove(artPath)
+
+		// Create tombstone for canonical state deletion
+		prevHash := ""
+		delRev := 1
+		if existingEnv, ok := tx.v.entities[id]; ok {
+			prevHash = existingEnv.RevisionHash
+			delRev = existingEnv.Revision
+		} else if existingArt, ok := tx.v.artifacts[id]; ok {
+			prevHash = existingArt.Fingerprint
+		}
+
+		if prevHash != "" {
+			_ = os.MkdirAll(tombDir, 0700)
+			ts := &model.Tombstone{
+				EntityID:             id,
+				DeletedRevision:      delRev,
+				DeletedAt:            time.Now(),
+				OriginMachineID:      tx.v.Machine.MachineID,
+				PreviousRevisionHash: prevHash,
+			}
+			data, _ := json.MarshalIndent(ts, "", "  ")
+			_ = fsutil.WriteFileAtomic(filepath.Join(tombDir, id+".json"), data, 0600)
+		}
 	}
 
 	if hook != nil {
@@ -280,16 +310,17 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 
 	if hook != nil {
 		if err := hook("during_final_swap"); err != nil {
-			_ = os.Rename(realArtifactsDir, stagedArtifactsDir)
+			_ = os.RemoveAll(realArtifactsDir)
 			_ = os.Rename(backupDir, realArtifactsDir)
 			return fmt.Errorf("injected fault during_final_swap: %w", err)
 		}
 	}
 
-	_ = os.RemoveAll(backupDir)
-
 	if hook != nil {
 		if err := hook("post_swap_pre_inmemory"); err != nil {
+			// Rollback disk swap so disk and in-memory stay in sync (OLD state)
+			_ = os.RemoveAll(realArtifactsDir)
+			_ = os.Rename(backupDir, realArtifactsDir)
 			return fmt.Errorf("injected fault post_swap_pre_inmemory: %w", err)
 		}
 	}
@@ -299,12 +330,14 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		tx.v.artifacts[id] = art.Clone()
 	}
 	for id, env := range tx.stagedEntities {
-		tx.v.entities[id] = env
+		tx.v.entities[id] = env.Clone()
 	}
 	for id := range tx.deletions {
 		delete(tx.v.artifacts, id)
 		delete(tx.v.entities, id)
 	}
+
+	_ = os.RemoveAll(backupDir)
 
 	tx.committed = true
 	return nil

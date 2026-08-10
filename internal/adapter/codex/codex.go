@@ -163,8 +163,11 @@ func (c *CodexAdapter) Import(ctx context.Context, machineID string) ([]*model.A
 	if err != nil {
 		return nil, err
 	}
-	artifacts := make([]*model.Artifact, 0, len(v2Envs))
+	artifacts := make([]*model.Artifact, 0)
 	for _, env := range v2Envs {
+		if env.Kind == model.KindSourceRecord {
+			continue
+		}
 		title := "instructions"
 		if env.Skill != nil && env.Skill.Name != "" {
 			title = env.Skill.Name
@@ -210,6 +213,7 @@ func (c *CodexAdapter) ImportV2(ctx context.Context, machineID string, opCtx *ad
 		return nil, err
 	}
 
+	root, _ := c.resolveRoot()
 	envelopes := make([]*model.EnvelopeV2, 0)
 
 	for _, detail := range scanRes.Details {
@@ -228,7 +232,6 @@ func (c *CodexAdapter) ImportV2(ctx context.Context, machineID string, opCtx *ad
 			continue
 		}
 
-		title := strings.TrimSuffix(filepath.Base(detail.Path), filepath.Ext(detail.Path))
 		scope := model.ScopeGlobal
 		projID := ""
 		if opCtx != nil && opCtx.WorkspacePath != "" && strings.HasPrefix(detail.Path, opCtx.WorkspacePath) {
@@ -236,65 +239,197 @@ func (c *CodexAdapter) ImportV2(ctx context.Context, machineID string, opCtx *ad
 			projID = opCtx.ProjectID
 		}
 
-		env := &model.EnvelopeV2{
+		logicalKey := adapter.ComputeLogicalSourceKey(c.Name(), root, detail.Path)
+		srcHash := model.ComputeFingerprint(model.KindInstruction, scope, logicalKey, content, nil)
+		sourceRecID := adapter.GenerateStableEntityID("apsr", c.Name(), logicalKey)
+
+		// 1. SourceRecord envelope
+		sourceEnv := &model.EnvelopeV2{
+			ID:            sourceRecID,
 			SchemaVersion: model.SchemaVersionV2,
+			Kind:          model.KindSourceRecord,
 			Scope:         scope,
 			ProjectID:     projID,
 			Revision:      1,
-			RevisionHash:  model.ComputeFingerprint(model.KindInstruction, scope, title, content, nil),
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
 			Lifecycle:     model.LifecyclePersistent,
 			Sensitivity:   model.SensitivityNormal,
+			SourceRecord: &model.SourceRecord{
+				ID:               sourceRecID,
+				Provider:         c.Name(),
+				MachineID:        machineID,
+				ProjectID:        projID,
+				SurfaceType:      detail.Kind,
+				LogicalSourceKey: logicalKey,
+				LocalPathRef:     detail.Path,
+				ContentType:      "text/plain",
+				Content:          content,
+				SourceHash:       srcHash,
+				ObservedAt:       time.Now(),
+				Revision:         1,
+				Status:           "present",
+			},
+		}
+		sourceEnv.RevisionHash = model.ComputeRevisionHash(sourceEnv)
+		if err := sourceEnv.Validate(); err == nil {
+			envelopes = append(envelopes, sourceEnv)
+		}
+
+		evidence := []model.EvidenceLink{
+			{
+				SourceRecordID: sourceRecID,
+				SourceRevision: 1,
+				ContentHash:    srcHash,
+			},
 		}
 
 		switch detail.Kind {
 		case string(model.KindSkillPackage):
-			env.ID = model.GenerateEntityID("aps")
-			env.Kind = model.KindSkillPackage
-			env.Skill = &model.SkillPackage{
-				Name:        title,
-				Description: "Codex imported skill package",
-				SkillMD:     content,
-				TrustState:  model.SkillTrustUntrusted,
+			skillPkg, err := adapter.ParseSkillPackage(detail.Path, content)
+			if err == nil {
+				env := &model.EnvelopeV2{
+					ID:            adapter.GenerateStableEntityID("aps", c.Name(), logicalKey),
+					SchemaVersion: model.SchemaVersionV2,
+					Kind:          model.KindSkillPackage,
+					Scope:         scope,
+					ProjectID:     projID,
+					Revision:      1,
+					CreatedAt:     time.Now(),
+					UpdatedAt:     time.Now(),
+					Lifecycle:     model.LifecyclePersistent,
+					Sensitivity:   model.SensitivityNormal,
+					Skill:         skillPkg,
+				}
+				env.RevisionHash = model.ComputeRevisionHash(env)
+				if err := env.Validate(); err == nil {
+					envelopes = append(envelopes, env)
+				}
 			}
 		case string(model.KindAgentDef):
-			env.ID = model.GenerateEntityID("apa")
-			env.Kind = model.KindAgentDef
-			env.Agent = &model.AgentDef{
-				Name:         title,
-				Description:  "Codex imported agent definition",
-				Instructions: content,
+			agentDef, err := adapter.ParseAgentDef(detail.Path, content)
+			if err == nil {
+				env := &model.EnvelopeV2{
+					ID:            adapter.GenerateStableEntityID("apa", c.Name(), logicalKey),
+					SchemaVersion: model.SchemaVersionV2,
+					Kind:          model.KindAgentDef,
+					Scope:         scope,
+					ProjectID:     projID,
+					Revision:      1,
+					CreatedAt:     time.Now(),
+					UpdatedAt:     time.Now(),
+					Lifecycle:     model.LifecyclePersistent,
+					Sensitivity:   model.SensitivityNormal,
+					Agent:         agentDef,
+				}
+				env.RevisionHash = model.ComputeRevisionHash(env)
+				if err := env.Validate(); err == nil {
+					envelopes = append(envelopes, env)
+				}
 			}
 		case string(model.KindMCPToolDef):
-			env.ID = model.GenerateEntityID("apmcp")
-			env.Kind = model.KindMCPToolDef
-			env.MCPTool = &model.MCPToolDef{
-				Name:      title,
-				Command:   "npx",
-				Transport: "stdio",
+			mcpTools, err := adapter.ParseMCPConfig(content)
+			if err == nil {
+				for idx, tool := range mcpTools {
+					toolID := fmt.Sprintf("%s_%d", adapter.GenerateStableEntityID("apmcp", c.Name(), logicalKey), idx)
+					env := &model.EnvelopeV2{
+						ID:            toolID,
+						SchemaVersion: model.SchemaVersionV2,
+						Kind:          model.KindMCPToolDef,
+						Scope:         scope,
+						ProjectID:     projID,
+						Revision:      1,
+						CreatedAt:     time.Now(),
+						UpdatedAt:     time.Now(),
+						Lifecycle:     model.LifecyclePersistent,
+						Sensitivity:   model.SensitivityNormal,
+						MCPTool:       tool,
+					}
+					env.RevisionHash = model.ComputeRevisionHash(env)
+					if err := env.Validate(); err == nil {
+						envelopes = append(envelopes, env)
+					}
+				}
 			}
 		default:
-			env.ID = model.GenerateEntityID("api")
-			env.Kind = model.KindInstructionV2
-			env.Memory = &model.MemoryPayload{
-				Statement:       content,
-				Category:        model.CategoryWorkflow,
-				Status:          model.MemoryStatusActive,
-				Importance:      8,
-				Confidence:      1.0,
-				Derivation:      model.DerivationImported,
-				LastConfirmedAt: time.Now(),
-				ReviewState:     "approved",
+			env := &model.EnvelopeV2{
+				ID:            adapter.GenerateStableEntityID("api", c.Name(), logicalKey),
+				SchemaVersion: model.SchemaVersionV2,
+				Kind:          model.KindInstructionV2,
+				Scope:         scope,
+				ProjectID:     projID,
+				Revision:      1,
+				CreatedAt:     time.Now(),
+				UpdatedAt:     time.Now(),
+				Lifecycle:     model.LifecyclePersistent,
+				Sensitivity:   model.SensitivityNormal,
+				Memory: &model.MemoryPayload{
+					Statement:       content,
+					Category:        model.CategoryWorkflow,
+					Status:          model.MemoryStatusActive,
+					Importance:      8,
+					Confidence:      1.0,
+					Derivation:      model.DerivationImported,
+					LastConfirmedAt: time.Now(),
+					Evidence:        evidence,
+					ReviewState:     "approved",
+				},
 			}
-		}
-
-		if err := env.Validate(); err == nil {
-			envelopes = append(envelopes, env)
+			env.RevisionHash = model.ComputeRevisionHash(env)
+			if err := env.Validate(); err == nil {
+				envelopes = append(envelopes, env)
+			}
 		}
 	}
 
 	return envelopes, nil
+}
+
+func (c *CodexAdapter) PlanExportV2(ctx context.Context, manifest *adapter.CompileManifest) (*adapter.ExportPlan, error) {
+	root, err := c.resolveRoot()
+	if err != nil {
+		return nil, err
+	}
+
+	plan := &adapter.ExportPlan{
+		Provider: c.Name(),
+		Items:    make([]*adapter.ExportItem, 0),
+	}
+
+	for _, item := range manifest.Items {
+		if !item.Included {
+			continue
+		}
+
+		fileName := strings.ToLower(item.Title)
+		fileName = strings.ReplaceAll(fileName, "codex: ", "")
+		fileName = strings.ReplaceAll(fileName, " ", "_") + ".md"
+		targetPath := filepath.Join(root, "exported", fileName)
+
+		expItem := &adapter.ExportItem{
+			SourceArtifactID: item.ArtifactID,
+			TargetPath:       targetPath,
+			ProposedContent:  item.Content,
+		}
+
+		if existingData, err := os.ReadFile(targetPath); err == nil {
+			expItem.CurrentContent = string(existingData)
+			if model.NormalizeContent(expItem.CurrentContent) == model.NormalizeContent(item.Content) {
+				expItem.Action = adapter.ActionUnchanged
+				expItem.DiffSummary = "No changes needed"
+			} else {
+				expItem.Action = adapter.ActionModify
+				expItem.DiffSummary = fmt.Sprintf("Modify %s (%d -> %d bytes)", fileName, len(expItem.CurrentContent), len(item.Content))
+			}
+		} else {
+			expItem.Action = adapter.ActionCreate
+			expItem.DiffSummary = fmt.Sprintf("Create %s (%d bytes)", fileName, len(item.Content))
+		}
+
+		plan.Items = append(plan.Items, expItem)
+	}
+
+	return plan, nil
 }
 
 func (c *CodexAdapter) PlanExport(ctx context.Context, artifacts []*model.Artifact) (*adapter.ExportPlan, error) {

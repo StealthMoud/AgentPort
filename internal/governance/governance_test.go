@@ -130,3 +130,199 @@ func TestProposalUndoRestoresState(t *testing.T) {
 		t.Fatalf("undo failed to restore original state!")
 	}
 }
+
+func TestGovernanceProposalOperations(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	mem1 := &model.EnvelopeV2{
+		ID:            "apm_mem1",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Statement 1",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	mem1.RevisionHash = model.ComputeRevisionHash(mem1)
+	_ = v.SaveEntity(mem1)
+
+	mem2 := &model.EnvelopeV2{
+		ID:            "apm_mem2",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Statement 2",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	mem2.RevisionHash = model.ComputeRevisionHash(mem2)
+	_ = v.SaveEntity(mem2)
+
+	stateRoot := model.ComputeV2StateRoot(v.ListEntities())
+
+	// 1. Create Proposal
+	pCreate := &compiler.Proposal{
+		ID:             "prop_create",
+		Operation:      compiler.OpCreate,
+		ProposedState:  "Brand new created memory",
+		Confidence:     0.9,
+		InputStateRoot: stateRoot,
+	}
+	if err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{pCreate}); err != nil {
+		t.Fatalf("OpCreate failed: %v", err)
+	}
+
+	stateRoot2 := model.ComputeV2StateRoot(v.ListEntities())
+
+	// 2. Merge Proposal (Merge mem1 and mem2)
+	pMerge := &compiler.Proposal{
+		ID:             "prop_merge",
+		Operation:      compiler.OpMerge,
+		TargetIDs:      []string{"apm_mem1", "apm_mem2"},
+		ProposedState:  "Merged Statement 1 & 2",
+		Confidence:     0.95,
+		InputStateRoot: stateRoot2,
+	}
+	if err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{pMerge}); err != nil {
+		t.Fatalf("OpMerge failed: %v", err)
+	}
+
+	// Verify mem1 and mem2 marked MemoryStatusSuperseded (not deleted)
+	m1, _ := v.GetEntity("apm_mem1")
+	if m1.Memory.Status != model.MemoryStatusSuperseded {
+		t.Errorf("expected mem1 status MemoryStatusSuperseded, got %s", m1.Memory.Status)
+	}
+
+	stateRoot3 := model.ComputeV2StateRoot(v.ListEntities())
+
+	// 3. Refine Proposal on mem1
+	pRefine := &compiler.Proposal{
+		ID:             "prop_refine",
+		Operation:      compiler.OpRefine,
+		TargetIDs:      []string{"apm_mem1"},
+		ProposedState:  "Refined Statement 1",
+		Confidence:     0.9,
+		InputStateRoot: stateRoot3,
+	}
+	if err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{pRefine}); err != nil {
+		t.Fatalf("OpRefine failed: %v", err)
+	}
+	m1Refined, _ := v.GetEntity("apm_mem1")
+	if m1Refined.Memory.Statement != "Refined Statement 1" {
+		t.Errorf("expected refined statement 'Refined Statement 1', got %s", m1Refined.Memory.Statement)
+	}
+
+	stateRoot4 := model.ComputeV2StateRoot(v.ListEntities())
+
+	// 4. Archive Proposal on mem2
+	pArchive := &compiler.Proposal{
+		ID:             "prop_archive",
+		Operation:      compiler.OpArchive,
+		TargetIDs:      []string{"apm_mem2"},
+		Confidence:     0.9,
+		InputStateRoot: stateRoot4,
+	}
+	if err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{pArchive}); err != nil {
+		t.Fatalf("OpArchive failed: %v", err)
+	}
+	m2Archived, _ := v.GetEntity("apm_mem2")
+	if m2Archived.Memory.Status != model.MemoryStatusArchived {
+		t.Errorf("expected status MemoryStatusArchived, got %s", m2Archived.Memory.Status)
+	}
+
+	stateRoot5 := model.ComputeV2StateRoot(v.ListEntities())
+
+	// 5. Mark Conflict Proposal
+	pConflict := &compiler.Proposal{
+		ID:             "prop_conflict",
+		Operation:      compiler.OpMarkConflict,
+		TargetIDs:      []string{"apm_mem1"},
+		Confidence:     0.9,
+		InputStateRoot: stateRoot5,
+	}
+	if err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{pConflict}); err != nil {
+		t.Fatalf("OpMarkConflict failed: %v", err)
+	}
+	m1Conflict, _ := v.GetEntity("apm_mem1")
+	if m1Conflict.Memory.Status != model.MemoryStatusContested {
+		t.Errorf("expected status MemoryStatusContested, got %s", m1Conflict.Memory.Status)
+	}
+
+	stateRoot6 := model.ComputeV2StateRoot(v.ListEntities())
+
+	// 6. Mark Stale Proposal
+	pStale := &compiler.Proposal{
+		ID:             "prop_stale",
+		Operation:      compiler.OpMarkStale,
+		TargetIDs:      []string{"apm_mem1"},
+		Confidence:     0.9,
+		InputStateRoot: stateRoot6,
+	}
+	if err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{pStale}); err != nil {
+		t.Fatalf("OpMarkStale failed: %v", err)
+	}
+	m1Stale, _ := v.GetEntity("apm_mem1")
+	if m1Stale.Memory.Status != model.MemoryStatusExpired {
+		t.Errorf("expected status MemoryStatusExpired, got %s", m1Stale.Memory.Status)
+	}
+
+	stateRoot7 := model.ComputeV2StateRoot(v.ListEntities())
+
+	// 7. Reclassify Proposal
+	pReclass := &compiler.Proposal{
+		ID:             "prop_reclass",
+		Operation:      compiler.OpReclassify,
+		TargetIDs:      []string{"apm_mem1"},
+		ProposedState:  string(model.CategoryDecision),
+		Confidence:     0.9,
+		InputStateRoot: stateRoot7,
+	}
+	if err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{pReclass}); err != nil {
+		t.Fatalf("OpReclassify failed: %v", err)
+	}
+	m1Reclass, _ := v.GetEntity("apm_mem1")
+	if m1Reclass.Memory.Category != model.CategoryDecision {
+		t.Errorf("expected category CategoryDecision, got %s", m1Reclass.Memory.Category)
+	}
+}
+
+func TestGovernanceStateRootValidation(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	staleProp := &compiler.Proposal{
+		ID:             "prop_stale_root",
+		Operation:      compiler.OpCreate,
+		ProposedState:  "State statement",
+		InputStateRoot: "STALE_EXPECTED_ROOT_HASH_9999",
+	}
+
+	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{staleProp})
+	if err == nil {
+		t.Fatalf("expected governance.ApplyProposals to reject proposal with stale state root")
+	}
+}

@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -278,3 +280,212 @@ type Tombstone struct {
 	OriginMachineID      string    `json:"origin_machine_id"`
 	PreviousRevisionHash string    `json:"previous_revision_hash"`
 }
+
+// Clone creates a deep copy of EvidenceLink.
+func (el EvidenceLink) Clone() EvidenceLink {
+	return el
+}
+
+// Clone creates a deep copy of MemoryPayload.
+func (mp *MemoryPayload) Clone() *MemoryPayload {
+	if mp == nil {
+		return nil
+	}
+	cloned := *mp
+	if mp.ValidFrom != nil {
+		t := *mp.ValidFrom
+		cloned.ValidFrom = &t
+	}
+	if mp.ValidUntil != nil {
+		t := *mp.ValidUntil
+		cloned.ValidUntil = &t
+	}
+	if mp.Supersedes != nil {
+		cloned.Supersedes = append([]string(nil), mp.Supersedes...)
+	}
+	if mp.ConflictsWith != nil {
+		cloned.ConflictsWith = append([]string(nil), mp.ConflictsWith...)
+	}
+	if mp.Evidence != nil {
+		cloned.Evidence = make([]EvidenceLink, len(mp.Evidence))
+		copy(cloned.Evidence, mp.Evidence)
+	}
+	return &cloned
+}
+
+// Clone creates a deep copy of SourceRecord.
+func (sr *SourceRecord) Clone() *SourceRecord {
+	if sr == nil {
+		return nil
+	}
+	cloned := *sr
+	if sr.Files != nil {
+		cloned.Files = make(map[string]string, len(sr.Files))
+		for k, v := range sr.Files {
+			cloned.Files[k] = v
+		}
+	}
+	return &cloned
+}
+
+// Clone creates a deep copy of SkillPackage.
+func (sp *SkillPackage) Clone() *SkillPackage {
+	if sp == nil {
+		return nil
+	}
+	cloned := *sp
+	if sp.Scripts != nil {
+		cloned.Scripts = make(map[string]string, len(sp.Scripts))
+		for k, v := range sp.Scripts {
+			cloned.Scripts[k] = v
+		}
+	}
+	if sp.References != nil {
+		cloned.References = make(map[string]string, len(sp.References))
+		for k, v := range sp.References {
+			cloned.References[k] = v
+		}
+	}
+	if sp.Assets != nil {
+		cloned.Assets = make(map[string]string, len(sp.Assets))
+		for k, v := range sp.Assets {
+			cloned.Assets[k] = v
+		}
+	}
+	return &cloned
+}
+
+// Clone creates a deep copy of AgentDef.
+func (ad *AgentDef) Clone() *AgentDef {
+	if ad == nil {
+		return nil
+	}
+	cloned := *ad
+	if ad.Capabilities != nil {
+		cloned.Capabilities = append([]string(nil), ad.Capabilities...)
+	}
+	if ad.Skills != nil {
+		cloned.Skills = append([]string(nil), ad.Skills...)
+	}
+	return &cloned
+}
+
+// Clone creates a deep copy of MCPToolDef.
+func (mt *MCPToolDef) Clone() *MCPToolDef {
+	if mt == nil {
+		return nil
+	}
+	cloned := *mt
+	if mt.Args != nil {
+		cloned.Args = append([]string(nil), mt.Args...)
+	}
+	if mt.EnvVarNames != nil {
+		cloned.EnvVarNames = append([]string(nil), mt.EnvVarNames...)
+	}
+	return &cloned
+}
+
+// Clone creates a complete deep copy of EnvelopeV2.
+func (e *EnvelopeV2) Clone() *EnvelopeV2 {
+	if e == nil {
+		return nil
+	}
+	cloned := *e
+	if e.Tags != nil {
+		cloned.Tags = append([]string(nil), e.Tags...)
+	}
+	if e.Provenance != nil {
+		cloned.Provenance = make([]Provenance, len(e.Provenance))
+		copy(cloned.Provenance, e.Provenance)
+	}
+	if e.Metadata != nil {
+		cloned.Metadata = make(map[string]string, len(e.Metadata))
+		for k, v := range e.Metadata {
+			cloned.Metadata[k] = v
+		}
+	}
+	cloned.SourceRecord = e.SourceRecord.Clone()
+	cloned.Memory = e.Memory.Clone()
+	cloned.Skill = e.Skill.Clone()
+	cloned.Agent = e.Agent.Clone()
+	cloned.MCPTool = e.MCPTool.Clone()
+	return &cloned
+}
+
+// ComputeRevisionHash calculates a canonical, deterministic revision hash for a V2 entity.
+// It covers semantic state and excludes non-semantic timestamp noise.
+func ComputeRevisionHash(env *EnvelopeV2) string {
+	var payloadStr string
+
+	switch env.Kind {
+	case KindMemoryV2, KindInstructionV2, KindPreferenceV2, KindProjectContextV2:
+		if env.Memory != nil {
+			payloadStr = fmt.Sprintf("stmt:%s|cat:%s|stat:%s|imp:%d|conf:%.2f|deriv:%s|revst:%s",
+				env.Memory.Statement, env.Memory.Category, env.Memory.Status,
+				env.Memory.Importance, env.Memory.Confidence, env.Memory.Derivation, env.Memory.ReviewState)
+		}
+	case KindSourceRecord:
+		if env.SourceRecord != nil {
+			payloadStr = fmt.Sprintf("prov:%s|surf:%s|key:%s|hash:%s|stat:%s|content:%s",
+				env.SourceRecord.Provider, env.SourceRecord.SurfaceType, env.SourceRecord.LogicalSourceKey,
+				env.SourceRecord.SourceHash, env.SourceRecord.Status, env.SourceRecord.Content)
+		}
+	case KindSkillPackage:
+		if env.Skill != nil {
+			payloadStr = fmt.Sprintf("name:%s|desc:%s|md:%s|trust:%s|exec:%v",
+				env.Skill.Name, env.Skill.Description, env.Skill.SkillMD, env.Skill.TrustState, env.Skill.HasExecutables)
+		}
+	case KindAgentDef:
+		if env.Agent != nil {
+			payloadStr = fmt.Sprintf("name:%s|desc:%s|inst:%s|model:%s",
+				env.Agent.Name, env.Agent.Description, env.Agent.Instructions, env.Agent.PreferredModelClass)
+		}
+	case KindMCPToolDef:
+		if env.MCPTool != nil {
+			payloadStr = fmt.Sprintf("name:%s|cmd:%s|url:%s|trans:%s|reqcred:%v",
+				env.MCPTool.Name, env.MCPTool.Command, env.MCPTool.URL, env.MCPTool.Transport, env.MCPTool.RequiresCredential)
+		}
+	}
+
+	metaStr := ""
+	if len(env.Metadata) > 0 {
+		var keys []string
+		for k := range env.Metadata {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			metaStr += fmt.Sprintf("%s=%s;", k, env.Metadata[k])
+		}
+	}
+
+	tagsStr := ""
+	if len(env.Tags) > 0 {
+		sortedTags := append([]string(nil), env.Tags...)
+		sort.Strings(sortedTags)
+		tagsStr = strings.Join(sortedTags, ",")
+	}
+
+	combined := fmt.Sprintf("kind:%s|scope:%s|proj:%s|rev:%d|sens:%s|life:%s|tags:%s|meta:%s|payload:%s",
+		env.Kind, env.Scope, env.ProjectID, env.Revision, env.Sensitivity, env.Lifecycle, tagsStr, metaStr, payloadStr)
+
+	return ComputeFingerprint(KindMemory, ScopeGlobal, "v2_revision", combined, nil)
+}
+
+// ComputeV2StateRoot calculates a deterministic state root from V2 envelopes sorted by ID.
+func ComputeV2StateRoot(entities []*EnvelopeV2) string {
+	sorted := make([]*EnvelopeV2, len(entities))
+	copy(sorted, entities)
+
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].ID < sorted[j].ID
+	})
+
+	var total string
+	for _, env := range sorted {
+		total += fmt.Sprintf("%s:%d:%s|", env.ID, env.Revision, env.RevisionHash)
+	}
+
+	return ComputeFingerprint(KindMemory, ScopeGlobal, "vault_v2_state_root", total, nil)
+}
+

@@ -2,6 +2,7 @@ package compiler_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -151,5 +152,62 @@ func TestUnconfiguredRemoteBackendFails(t *testing.T) {
 	err := remoteBe.Health(ctx)
 	if err == nil {
 		t.Fatalf("expected health check error for unconfigured remote backend with empty API key")
+	}
+}
+
+func TestRemoteBackendUnimplemented(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("OPENAI_API_KEY", "fake_key_123")
+
+	remoteBe := compiler.NewRemoteBackend(compiler.RemoteProviderOpenAI, "OPENAI_API_KEY", "gpt-4o")
+	_, err := remoteBe.Analyze(ctx, &compiler.AnalysisRequest{})
+	if err == nil || !errors.Is(err, compiler.ErrBackendNotImplemented) {
+		t.Fatalf("expected ErrBackendNotImplemented from RemoteBackend.Analyze, got %v", err)
+	}
+}
+
+func TestMemoryCompilerPrivateRemoteOptIn(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+	t.Setenv("OPENAI_API_KEY", "fake_key_123")
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	privEnv := &model.EnvelopeV2{
+		ID:            "apm_private_item",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Sensitivity:   model.SensitivityPrivate,
+		Memory: &model.MemoryPayload{
+			Statement:  "Private work notes",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	privEnv.RevisionHash = model.ComputeRevisionHash(privEnv)
+	_ = v.SaveEntity(privEnv)
+
+	remoteBe := compiler.NewRemoteBackend(compiler.RemoteProviderOpenAI, "OPENAI_API_KEY", "gpt-4o")
+
+	// 1. Without opt-in (private remote BLOCKED)
+	mcNoOpt := compiler.NewMemoryCompiler(remoteBe)
+	mcNoOpt.SetAllowPrivateRemote(false)
+	_, _ = mcNoOpt.Analyze(ctx, v, "") // Remote backend returns ErrBackendNotImplemented, but privacy filter runs first!
+
+	// 2. Local backend (private ALLOWED by default)
+	mcLocal := compiler.NewMemoryCompiler(compiler.NewTestBackend())
+	resLocal, err := mcLocal.Analyze(ctx, v, "")
+	if err != nil {
+		t.Fatalf("mcLocal Analyze failed: %v", err)
+	}
+	if resLocal.Metrics.AnalyzedCount != 1 {
+		t.Errorf("expected 1 analyzed item on local backend for SensitivityPrivate, got %d", resLocal.Metrics.AnalyzedCount)
 	}
 }

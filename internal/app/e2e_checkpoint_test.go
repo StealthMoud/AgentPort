@@ -14,7 +14,6 @@ import (
 	contextpkg "github.com/StealthMoud/AgentPort/internal/context"
 	"github.com/StealthMoud/AgentPort/internal/gitstore"
 	"github.com/StealthMoud/AgentPort/internal/governance"
-	"github.com/StealthMoud/AgentPort/internal/model"
 	"github.com/StealthMoud/AgentPort/internal/vault"
 )
 
@@ -59,14 +58,14 @@ func TestMasterEndToEndCorrectiveCheckpoint(t *testing.T) {
 
 	// Machine A: Import from Codex
 	codexAdA := codex.New(codexRootA)
-	artifactsA, err := codexAdA.Import(ctx, vA.Machine.MachineID)
-	if err != nil || len(artifactsA) == 0 {
-		t.Fatalf("Import from Codex on A failed: %v", err)
+	envsA, err := codexAdA.ImportV2(ctx, vA.Machine.MachineID, nil)
+	if err != nil || len(envsA) == 0 {
+		t.Fatalf("ImportV2 from Codex on A failed: %v", err)
 	}
 
-	for _, art := range artifactsA {
-		if err := vA.SaveArtifact(art); err != nil {
-			t.Fatalf("SaveArtifact on A failed: %v", err)
+	for _, env := range envsA {
+		if err := vA.SaveEntity(env); err != nil {
+			t.Fatalf("SaveEntity on A failed: %v", err)
 		}
 	}
 
@@ -82,18 +81,8 @@ func TestMasterEndToEndCorrectiveCheckpoint(t *testing.T) {
 		psA := governance.NewProposalStore(cfgA)
 		_ = psA.SaveProposal(prop)
 
-		txA := vA.BeginTx()
-		newArt := &model.Artifact{
-			SchemaVersion: model.SchemaVersionV1,
-			Kind:          model.KindMemory,
-			Scope:         model.ScopeGlobal,
-			Title:         "Compiled Memory A",
-			Content:       prop.ProposedState,
-			Sensitivity:   model.SensitivityNormal,
-		}
-		_ = txA.SaveArtifact(newArt)
-		if err := txA.Commit(); err != nil {
-			t.Fatalf("txA.Commit failed: %v", err)
+		if err := governance.ApplyProposals(vA, cfgA, []*compiler.Proposal{prop}); err != nil {
+			t.Fatalf("ApplyProposals failed: %v", err)
 		}
 	}
 
@@ -106,9 +95,9 @@ func TestMasterEndToEndCorrectiveCheckpoint(t *testing.T) {
 		t.Fatalf("Context Compile on A failed: %v", err)
 	}
 
-	exportPlanA, err := claudeAdA.PlanExport(ctx, vA.ListArtifacts())
+	exportPlanA, err := claudeAdA.PlanExportV2(ctx, manifestA)
 	if err != nil {
-		t.Fatalf("PlanExport to Claude failed: %v", err)
+		t.Fatalf("PlanExportV2 to Claude failed: %v", err)
 	}
 	_, err = claudeAdA.ApplyExport(ctx, exportPlanA)
 	if err != nil {
@@ -162,20 +151,22 @@ func TestMasterEndToEndCorrectiveCheckpoint(t *testing.T) {
 
 	// Machine B: Export to Gemini
 	geminiAdB := gemini.New(geminiRootB)
-	planB, err := geminiAdB.PlanExport(ctx, vB.ListArtifacts())
+	ccB := contextpkg.NewContextCompiler(nil)
+	manifestB, _ := ccB.Compile(ctx, vB, "gemini", geminiAdB.Capabilities())
+	planB, err := geminiAdB.PlanExportV2(ctx, manifestB)
 	if err != nil {
-		t.Fatalf("PlanExport on B failed: %v", err)
+		t.Fatalf("PlanExportV2 on B failed: %v", err)
 	}
 	_, _ = geminiAdB.ApplyExport(ctx, planB)
 
-	// 3. Delete one entity on A
-	artToDelete := artifactsA[0].ID
-	if err := vA.DeleteArtifact(artToDelete); err != nil {
-		t.Fatalf("DeleteArtifact on A failed: %v", err)
+	// 3. Delete one V2 entity on A
+	entityToDelete := envsA[0].ID
+	if err := vA.DeleteEntity(entityToDelete); err != nil {
+		t.Fatalf("DeleteEntity on A failed: %v", err)
 	}
 
 	// Verify tombstone created on A
-	if _, tombExists := vA.GetTombstone(artToDelete); !tombExists {
+	if _, tombExists := vA.GetTombstone(entityToDelete); !tombExists {
 		t.Fatalf("expected tombstone for deleted entity on A")
 	}
 
@@ -186,7 +177,7 @@ func TestMasterEndToEndCorrectiveCheckpoint(t *testing.T) {
 	_, _ = storeB.Sync(ctx, vB, false)
 
 	// Verify entity does NOT resurrect on B
-	if _, existsOnB := vB.GetArtifact(artToDelete); existsOnB {
+	if _, existsOnB := vB.GetEntity(entityToDelete); existsOnB {
 		t.Fatalf("deleted entity resurrected on Computer B after sync!")
 	}
 

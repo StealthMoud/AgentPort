@@ -85,6 +85,29 @@ type OperationContext struct {
 	Scope         model.Scope `json:"scope"`
 }
 
+type CompileItem struct {
+	ArtifactID   string `json:"artifact_id"`
+	Title        string `json:"title"`
+	Kind         string `json:"kind"`
+	Scope        string `json:"scope"`
+	Priority     int    `json:"priority"`
+	Included     bool   `json:"included"`
+	Reason       string `json:"reason"`
+	EstTokenCost int    `json:"est_token_cost"`
+	Content      string `json:"content,omitempty"`
+}
+
+type CompileManifest struct {
+	TargetProvider  string         `json:"target_provider"`
+	StateRoot       string         `json:"state_root"`
+	WorkspacePath   string         `json:"workspace_path,omitempty"`
+	Estimator       string         `json:"estimator"`
+	Budget          interface{}    `json:"budget"`
+	TotalTokensEst  int            `json:"total_tokens_est"`
+	Items           []*CompileItem `json:"items"`
+	CompiledContent string         `json:"compiled_content"`
+}
+
 type Adapter interface {
 	Name() string
 	Detect(ctx context.Context) (*DetectResult, error)
@@ -93,6 +116,7 @@ type Adapter interface {
 	Import(ctx context.Context, machineID string) ([]*model.Artifact, error)
 	ImportV2(ctx context.Context, machineID string, opCtx *OperationContext) ([]*model.EnvelopeV2, error)
 	PlanExport(ctx context.Context, artifacts []*model.Artifact) (*ExportPlan, error)
+	PlanExportV2(ctx context.Context, manifest *CompileManifest) (*ExportPlan, error)
 	ApplyExport(ctx context.Context, plan *ExportPlan) (*ExportResult, error)
 	Validate(ctx context.Context) error
 }

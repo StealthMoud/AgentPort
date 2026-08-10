@@ -148,3 +148,97 @@ func TestContextCompilerCategoryBudgets(t *testing.T) {
 		t.Errorf("expected oversized instruction item to be excluded due to category budget cap")
 	}
 }
+
+func TestContextCompilerWorkspaceIsolation(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	// 1. Global memory
+	envGlobal := &model.EnvelopeV2{
+		ID:            "apm_global_mem",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Memory: &model.MemoryPayload{
+			Statement:  "Global memory available everywhere",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	envGlobal.RevisionHash = model.ComputeRevisionHash(envGlobal)
+	_ = v.SaveEntity(envGlobal)
+
+	// 2. Project A memory
+	envProjA := &model.EnvelopeV2{
+		ID:            "apm_proja_mem",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeProject,
+		ProjectID:     "proj_A",
+		Memory: &model.MemoryPayload{
+			Statement:  "Project A specific memory",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	envProjA.RevisionHash = model.ComputeRevisionHash(envProjA)
+	_ = v.SaveEntity(envProjA)
+
+	// 3. Project B memory
+	envProjB := &model.EnvelopeV2{
+		ID:            "apm_projb_mem",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeProject,
+		ProjectID:     "proj_B",
+		Memory: &model.MemoryPayload{
+			Statement:  "Project B specific memory",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	envProjB.RevisionHash = model.ComputeRevisionHash(envProjB)
+	_ = v.SaveEntity(envProjB)
+
+	// Compile for Project A
+	cc := contextpkg.NewContextCompiler(nil)
+	cc.SetTargetProjectID("proj_A")
+
+	caps := adapter.Capabilities{Memory: adapter.SupportFull}
+	m, err := cc.Compile(ctx, v, "codex", caps)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	includedIDs := make(map[string]bool)
+	for _, item := range m.Items {
+		if item.Included {
+			includedIDs[item.ArtifactID] = true
+		}
+	}
+
+	if !includedIDs["apm_global_mem"] {
+		t.Errorf("expected global memory apm_global_mem to be included")
+	}
+	if !includedIDs["apm_proja_mem"] {
+		t.Errorf("expected target project A memory apm_proja_mem to be included")
+	}
+	if includedIDs["apm_projb_mem"] {
+		t.Errorf("project B memory apm_projb_mem LEAKED into project A compile manifest!")
+	}
+}

@@ -172,5 +172,105 @@ func newMigrateCmd() *cobra.Command {
 		},
 	})
 
+	cmd.AddCommand(&cobra.Command{
+		Use:   "rollback",
+		Short: "Rollback local vault canonical state from Schema V2 to Schema V1",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			v, err := vault.LoadOpen(cfg)
+			if err != nil {
+				return err
+			}
+
+			// 1. Create backup snapshot
+			snapMgr := snapshot.NewManager(cfg)
+			snap, err := snapMgr.CreateSnapshot(v, "pre_rollback_backup")
+			if err != nil {
+				return fmt.Errorf("failed creating pre-rollback snapshot: %w", err)
+			}
+
+			// 2. Convert V2 entities to V1 artifacts
+			entities := v.ListEntities()
+			v1Artifacts := make([]*model.Artifact, 0)
+			for _, env := range entities {
+				if env.Kind == model.KindSourceRecord {
+					continue
+				}
+				content := ""
+				kind := model.KindInstruction
+				title := env.ID
+				if env.Memory != nil {
+					content = env.Memory.Statement
+					kind = model.KindMemory
+				} else if env.Skill != nil {
+					content = env.Skill.SkillMD
+					title = env.Skill.Name
+					kind = model.KindSkill
+				} else if env.Agent != nil {
+					content = env.Agent.Instructions
+					title = env.Agent.Name
+					kind = model.KindAgent
+				} else if env.MCPTool != nil {
+					content = env.MCPTool.Command
+					title = env.MCPTool.Name
+					kind = model.KindToolDefinition
+				}
+				art := &model.Artifact{
+					SchemaVersion: model.SchemaVersionV1,
+					Kind:          kind,
+					Scope:         env.Scope,
+					Title:         title,
+					Content:       content,
+					ContentType:   "text/markdown",
+					Lifecycle:     model.LifecyclePersistent,
+					Sensitivity:   env.Sensitivity,
+					CreatedAt:     env.CreatedAt,
+					UpdatedAt:     env.UpdatedAt,
+				}
+				art.UpdateFingerprint()
+				art.ID = model.GenerateArtifactID(art.Kind, art.Fingerprint)
+				v1Artifacts = append(v1Artifacts, art)
+			}
+
+			// 3. Perform atomic transaction swap
+			tx := v.BeginTx()
+			for _, env := range entities {
+				_ = tx.DeleteEntity(env.ID)
+			}
+			for _, art := range v1Artifacts {
+				if err := tx.SaveArtifact(art); err != nil {
+					_ = tx.Rollback()
+					_ = snapMgr.RestoreSnapshot(v, snap.SnapshotID)
+					return fmt.Errorf("failed saving V1 artifact during rollback: %w", err)
+				}
+			}
+
+			if err := tx.Commit(); err != nil {
+				_ = snapMgr.RestoreSnapshot(v, snap.SnapshotID)
+				return fmt.Errorf("rollback transaction failed: %w", err)
+			}
+
+			// 4. Update vault metadata
+			v.Metadata.SchemaVersion = model.SchemaVersionV1
+			metaBytes, _ := json.MarshalIndent(v.Metadata, "", "  ")
+			_ = fsutil.WriteFileAtomic(filepath.Join(cfg.VaultDir, "vault.json"), metaBytes, 0600)
+
+			// 5. Audit event
+			j := governance.NewJournal(cfg)
+			_ = j.RecordEvent(&governance.AuditEvent{
+				Actor:     "migration",
+				Operation: "V2_TO_V1_ROLLBACK",
+				TargetID:  v.Metadata.VaultID,
+			})
+
+			fmt.Println("\n✓ Rollback to Schema V1 successfully applied!")
+			fmt.Printf("Converted %d V2 entities back to V1 artifacts.\n", len(v1Artifacts))
+			return nil
+		},
+	})
+
 	return cmd
 }

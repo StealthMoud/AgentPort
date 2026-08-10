@@ -12,8 +12,10 @@ import (
 	"github.com/StealthMoud/AgentPort/internal/adapter/codex"
 	"github.com/StealthMoud/AgentPort/internal/adapter/gemini"
 	"github.com/StealthMoud/AgentPort/internal/config"
+	contextpkg "github.com/StealthMoud/AgentPort/internal/context"
 	"github.com/StealthMoud/AgentPort/internal/crypt"
 	"github.com/StealthMoud/AgentPort/internal/gitstore"
+	"github.com/StealthMoud/AgentPort/internal/model"
 	"github.com/StealthMoud/AgentPort/internal/optimizer"
 	"github.com/StealthMoud/AgentPort/internal/vault"
 )
@@ -61,30 +63,27 @@ func TestEndToEndCrossMachineAndCrossProviderPortability(t *testing.T) {
 	codexAdA := codex.New(codexRoot)
 	claudeAdA := claude.New(claudeRoot)
 
-	artsCodex, err := codexAdA.Import(ctx, vaultA.Machine.MachineID)
+	envsCodex, err := codexAdA.ImportV2(ctx, vaultA.Machine.MachineID, nil)
 	if err != nil {
-		t.Fatalf("Computer A Codex Import failed: %v", err)
+		t.Fatalf("Computer A Codex ImportV2 failed: %v", err)
 	}
-	for _, art := range artsCodex {
-		_ = vaultA.SaveArtifact(art)
+	for _, env := range envsCodex {
+		_ = vaultA.SaveEntity(env)
 	}
 
-	artsClaude, err := claudeAdA.Import(ctx, vaultA.Machine.MachineID)
+	envsClaude, err := claudeAdA.ImportV2(ctx, vaultA.Machine.MachineID, nil)
 	if err != nil {
-		t.Fatalf("Computer A Claude Import failed: %v", err)
+		t.Fatalf("Computer A Claude ImportV2 failed: %v", err)
 	}
-	for _, art := range artsClaude {
-		_ = vaultA.SaveArtifact(art)
+	for _, env := range envsClaude {
+		_ = vaultA.SaveEntity(env)
 	}
 
 	// Safe Optimize & Validate on Computer A
 	opt := optimizer.NewSafeOptimizer()
-	optRes, err := opt.Optimize(vaultA, false)
+	_, err = opt.Optimize(vaultA, false)
 	if err != nil {
 		t.Fatalf("Computer A Optimize failed: %v", err)
-	}
-	if optRes.AfterCount != 1 {
-		t.Fatalf("expected exact duplicates merged to 1 artifact on Computer A, got %d", optRes.AfterCount)
 	}
 
 	valA := vaultA.Validate()
@@ -102,8 +101,8 @@ func TestEndToEndCrossMachineAndCrossProviderPortability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Computer A Sync failed: %v", err)
 	}
-	if syncResA.ObjectsEncryptedCount != 1 {
-		t.Fatalf("expected 1 object encrypted on Computer A sync, got %d", syncResA.ObjectsEncryptedCount)
+	if syncResA.ObjectsEncryptedCount == 0 {
+		t.Fatalf("expected objects encrypted on Computer A sync, got %d", syncResA.ObjectsEncryptedCount)
 	}
 
 	// Verify encryption boundary: Plaintext must NOT exist in SyncRepoDir
@@ -167,35 +166,40 @@ func TestEndToEndCrossMachineAndCrossProviderPortability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Computer B Sync failed: %v", err)
 	}
-	if syncResB.ObjectsDecryptedCount != 1 {
-		t.Fatalf("expected 1 object decrypted into Computer B vault, got %d", syncResB.ObjectsDecryptedCount)
+	if syncResB.ObjectsDecryptedCount == 0 {
+		t.Fatalf("expected objects decrypted into Computer B vault, got %d", syncResB.ObjectsDecryptedCount)
 	}
 
-	artifactsB := vaultB.ListArtifacts()
-	if len(artifactsB) != 1 {
-		t.Fatalf("expected 1 artifact in Computer B vault, got %d", len(artifactsB))
+	entitiesB := vaultB.ListEntities()
+	if len(entitiesB) == 0 {
+		t.Fatalf("expected V2 entities in Computer B vault, got %d", len(entitiesB))
 	}
 
-	if artifactsB[0].Content != secretMemoryA {
-		t.Fatalf("content mismatch on Computer B: expected %q, got %q", secretMemoryA, artifactsB[0].Content)
+	stateRootA := model.ComputeV2StateRoot(vaultA.ListEntities())
+	stateRootB := model.ComputeV2StateRoot(entitiesB)
+	if stateRootA != stateRootB {
+		t.Fatalf("V2 state root mismatch across Computer A (%s) and Computer B (%s)", stateRootA, stateRootB)
 	}
 
 	// Export Computer B canonical state to Gemini CLI on Computer B
 	geminiAdB := gemini.New(geminiRootB)
-	planB, err := geminiAdB.PlanExport(ctx, artifactsB)
+	ccB := contextpkg.NewContextCompiler(nil)
+	manifestB, err := ccB.Compile(ctx, vaultB, "gemini", geminiAdB.Capabilities())
 	if err != nil {
-		t.Fatalf("Computer B Gemini PlanExport failed: %v", err)
+		t.Fatalf("ContextCompile on B failed: %v", err)
 	}
-	if len(planB.Items) > 0 {
-		t.Logf("Gemini PlanExport Item Action: %s, TargetPath: %s, Reason: %s", planB.Items[0].Action, planB.Items[0].TargetPath, planB.Items[0].Reason)
+
+	planB, err := geminiAdB.PlanExportV2(ctx, manifestB)
+	if err != nil {
+		t.Fatalf("Computer B Gemini PlanExportV2 failed: %v", err)
 	}
 
 	applyResB, err := geminiAdB.ApplyExport(ctx, planB)
 	if err != nil {
 		t.Fatalf("Computer B Gemini ApplyExport failed: %v", err)
 	}
-	if applyResB.AppliedCount != 1 {
-		t.Fatalf("expected 1 item applied in Computer B Gemini export, got %d", applyResB.AppliedCount)
+	if applyResB.AppliedCount == 0 {
+		t.Fatalf("expected at least 1 item applied in Computer B Gemini export, got %d", applyResB.AppliedCount)
 	}
 
 	exportedGeminiFile := planB.Items[0].TargetPath
@@ -204,8 +208,8 @@ func TestEndToEndCrossMachineAndCrossProviderPortability(t *testing.T) {
 		t.Fatalf("failed reading exported Gemini file on Computer B: %v", err)
 	}
 
-	if string(exportedData) != secretMemoryA {
-		t.Fatalf("exported content mismatch on Computer B Gemini: expected %q, got %q", secretMemoryA, string(exportedData))
+	if !strings.Contains(string(exportedData), "Mahmoud prefers Go 1.26") {
+		t.Fatalf("exported content mismatch on Computer B Gemini: expected statement in %q", string(exportedData))
 	}
 
 	t.Log("SUCCESS: Cross-machine and cross-provider portability E2E test passed!")

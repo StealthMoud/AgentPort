@@ -2,8 +2,10 @@ package adapter_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/StealthMoud/AgentPort/internal/adapter"
@@ -111,6 +113,16 @@ func TestMaliciousMarkdownIgnoredByExplicitSurfaceScanners(t *testing.T) {
 	}
 }
 
+func filterNonSourceRecord(envs []*model.EnvelopeV2) []*model.EnvelopeV2 {
+	res := make([]*model.EnvelopeV2, 0)
+	for _, env := range envs {
+		if env.Kind != model.KindSourceRecord {
+			res = append(res, env)
+		}
+	}
+	return res
+}
+
 func TestCodexSkillImportsAsSkillPackage(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -124,13 +136,14 @@ func TestCodexSkillImportsAsSkillPackage(t *testing.T) {
 		t.Fatalf("ImportV2 failed: %v", err)
 	}
 
-	if len(v2Envs) != 1 {
-		t.Fatalf("expected 1 V2 envelope, got %d", len(v2Envs))
+	typedEnvs := filterNonSourceRecord(v2Envs)
+	if len(typedEnvs) != 1 {
+		t.Fatalf("expected 1 typed V2 envelope, got %d", len(typedEnvs))
 	}
-	if v2Envs[0].Kind != model.KindSkillPackage {
-		t.Fatalf("expected KindSkillPackage, got %s", v2Envs[0].Kind)
+	if typedEnvs[0].Kind != model.KindSkillPackage {
+		t.Fatalf("expected KindSkillPackage, got %s", typedEnvs[0].Kind)
 	}
-	if v2Envs[0].Skill == nil || v2Envs[0].Skill.SkillMD == "" {
+	if typedEnvs[0].Skill == nil || typedEnvs[0].Skill.SkillMD == "" {
 		t.Errorf("expected SkillPackage payload with SkillMD content")
 	}
 }
@@ -148,11 +161,12 @@ func TestCodexAgentImportsAsAgentDef(t *testing.T) {
 		t.Fatalf("ImportV2 failed: %v", err)
 	}
 
-	if len(v2Envs) != 1 {
-		t.Fatalf("expected 1 V2 envelope, got %d", len(v2Envs))
+	typedEnvs := filterNonSourceRecord(v2Envs)
+	if len(typedEnvs) != 1 {
+		t.Fatalf("expected 1 typed V2 envelope, got %d", len(typedEnvs))
 	}
-	if v2Envs[0].Kind != model.KindAgentDef {
-		t.Fatalf("expected KindAgentDef, got %s", v2Envs[0].Kind)
+	if typedEnvs[0].Kind != model.KindAgentDef {
+		t.Fatalf("expected KindAgentDef, got %s", typedEnvs[0].Kind)
 	}
 }
 
@@ -167,11 +181,37 @@ func TestMCPSecretsStripped(t *testing.T) {
 		t.Fatalf("ImportV2 failed: %v", err)
 	}
 
-	if len(v2Envs) != 1 {
-		t.Fatalf("expected 1 V2 envelope, got %d", len(v2Envs))
+	typedEnvs := filterNonSourceRecord(v2Envs)
+	if len(typedEnvs) != 1 {
+		t.Fatalf("expected 1 typed V2 envelope, got %d", len(typedEnvs))
 	}
-	if v2Envs[0].Kind != model.KindMCPToolDef {
-		t.Fatalf("expected KindMCPToolDef, got %s", v2Envs[0].Kind)
+	env := typedEnvs[0]
+	if env.Kind != model.KindMCPToolDef {
+		t.Fatalf("expected KindMCPToolDef, got %s", env.Kind)
+	}
+
+	if env.MCPTool == nil {
+		t.Fatalf("expected MCPTool payload")
+	}
+
+	if !env.MCPTool.RequiresCredential {
+		t.Errorf("expected RequiresCredential == true")
+	}
+
+	foundKey := false
+	for _, name := range env.MCPTool.EnvVarNames {
+		if name == "API_KEY" {
+			foundKey = true
+			break
+		}
+	}
+	if !foundKey {
+		t.Errorf("expected env var name API_KEY to be preserved in EnvVarNames")
+	}
+
+	data, _ := json.Marshal(env)
+	if strings.Contains(string(data), "secret_token") {
+		t.Errorf("secret literal 'secret_token' MUST NOT occur anywhere in EnvelopeV2, got: %s", string(data))
 	}
 }
 
@@ -194,10 +234,67 @@ func TestWorkspaceScopesProviderSurfaces(t *testing.T) {
 		t.Fatalf("ImportV2 failed: %v", err)
 	}
 
-	if len(v2Envs) != 1 {
-		t.Fatalf("expected 1 V2 envelope, got %d", len(v2Envs))
+	typedEnvs := filterNonSourceRecord(v2Envs)
+	if len(typedEnvs) != 1 {
+		t.Fatalf("expected 1 typed V2 envelope, got %d", len(typedEnvs))
 	}
-	if v2Envs[0].Scope != model.ScopeProject || v2Envs[0].ProjectID != "proj_123" {
-		t.Errorf("expected ScopeProject and ProjectID proj_123, got Scope %s and ProjectID %s", v2Envs[0].Scope, v2Envs[0].ProjectID)
+	if typedEnvs[0].Scope != model.ScopeProject || typedEnvs[0].ProjectID != "proj_123" {
+		t.Errorf("expected ScopeProject and ProjectID proj_123, got Scope %s and ProjectID %s", typedEnvs[0].Scope, typedEnvs[0].ProjectID)
+	}
+}
+
+func TestReimportIdempotency(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	instPath := filepath.Join(root, "AGENTS.md")
+	_ = os.WriteFile(instPath, []byte("Initial agent instruction."), 0600)
+
+	codexAd := codex.New(root)
+
+	// Import 1
+	envs1, err := codexAd.ImportV2(ctx, "apm_test_machine", nil)
+	if err != nil {
+		t.Fatalf("Import 1 failed: %v", err)
+	}
+	typed1 := filterNonSourceRecord(envs1)
+	if len(typed1) != 1 {
+		t.Fatalf("expected 1 typed envelope on import 1, got %d", len(typed1))
+	}
+	initialID := typed1[0].ID
+	initialHash := typed1[0].RevisionHash
+
+	// Import 2 (unchanged file)
+	envs2, err := codexAd.ImportV2(ctx, "apm_test_machine", nil)
+	if err != nil {
+		t.Fatalf("Import 2 failed: %v", err)
+	}
+	typed2 := filterNonSourceRecord(envs2)
+	if len(typed2) != 1 {
+		t.Fatalf("expected 1 typed envelope on import 2, got %d", len(typed2))
+	}
+
+	if typed2[0].ID != initialID {
+		t.Errorf("stable entity ID changed across re-imports of unchanged file: %s vs %s", initialID, typed2[0].ID)
+	}
+	if typed2[0].RevisionHash != initialHash {
+		t.Errorf("revision hash changed across re-imports of unchanged file: %s vs %s", initialHash, typed2[0].RevisionHash)
+	}
+
+	// Import 3 (modified file content)
+	_ = os.WriteFile(instPath, []byte("Modified agent instruction content!"), 0600)
+	envs3, err := codexAd.ImportV2(ctx, "apm_test_machine", nil)
+	if err != nil {
+		t.Fatalf("Import 3 failed: %v", err)
+	}
+	typed3 := filterNonSourceRecord(envs3)
+	if len(typed3) != 1 {
+		t.Fatalf("expected 1 typed envelope on import 3, got %d", len(typed3))
+	}
+
+	if typed3[0].ID != initialID {
+		t.Errorf("stable entity ID changed after modifying content: %s vs %s", initialID, typed3[0].ID)
+	}
+	if typed3[0].RevisionHash == initialHash {
+		t.Errorf("expected revision hash to change after modifying content, got identical hash: %s", initialHash)
 	}
 }

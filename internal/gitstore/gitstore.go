@@ -376,11 +376,15 @@ func (s *Store) decryptObjectsIntoVault(v *vault.Vault) (int, error) {
 	for _, artID := range keys {
 		obj := manifest.Objects[artID]
 		if obj.IsTombstone {
-			_ = v.DeleteArtifact(artID)
+			ts := &model.Tombstone{
+				EntityID:             artID,
+				PreviousRevisionHash: obj.Fingerprint,
+				DeletedAt:            obj.UpdatedAt,
+			}
+			_ = v.ApplyRemoteTombstone(ts)
 			continue
 		}
 		if _, isTomb := v.GetTombstone(artID); isTomb {
-			_ = v.DeleteArtifact(artID)
 			continue
 		}
 		objFile := filepath.Join(objectsDir, obj.OpaqueID+".age")

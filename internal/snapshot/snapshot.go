@@ -26,6 +26,7 @@ type SnapshotMetadata struct {
 	CreatedAt             time.Time `json:"created_at"`
 	VaultID               string    `json:"vault_id"`
 	ArtifactCount         int       `json:"artifact_count"`
+	EntityCount           int       `json:"entity_count"`
 	Reason                string    `json:"reason"`
 	VaultStateFingerprint string    `json:"vault_state_fingerprint"`
 }
@@ -44,24 +45,27 @@ func generateSnapshotID() string {
 	return fmt.Sprintf("snap_%d_%s", time.Now().Unix(), hex.EncodeToString(b))
 }
 
-// CreateSnapshot creates a complete backup snapshot of local vault artifacts.
+// CreateSnapshot creates a complete backup snapshot of local vault V1 artifacts and V2 entities.
 func (m *Manager) CreateSnapshot(v *vault.Vault, reason string) (*SnapshotMetadata, error) {
 	snapID := generateSnapshotID()
 	snapDir := filepath.Join(m.cfg.SnapshotsDir, snapID)
 	artifactsDir := filepath.Join(snapDir, "artifacts")
+	entitiesDir := filepath.Join(snapDir, "entities")
 
 	if err := os.MkdirAll(artifactsDir, 0700); err != nil {
-		return nil, fmt.Errorf("failed creating snapshot directory: %w", err)
+		return nil, fmt.Errorf("failed creating snapshot artifacts directory: %w", err)
+	}
+	if err := os.MkdirAll(entitiesDir, 0700); err != nil {
+		return nil, fmt.Errorf("failed creating snapshot entities directory: %w", err)
 	}
 
+	// 1. Save V1 artifacts
 	artifacts := v.ListArtifacts()
 	sort.Slice(artifacts, func(i, j int) bool {
 		return artifacts[i].ID < artifacts[j].ID
 	})
 
-	var totalFingerprints string
 	for _, art := range artifacts {
-		totalFingerprints += art.ID + ":" + art.Fingerprint + "|"
 		data, err := json.MarshalIndent(art, "", "  ")
 		if err != nil {
 			return nil, err
@@ -72,13 +76,38 @@ func (m *Manager) CreateSnapshot(v *vault.Vault, reason string) (*SnapshotMetada
 		}
 	}
 
-	stateFp := model.ComputeFingerprint(model.KindMemory, model.ScopeGlobal, "vault_state", totalFingerprints, nil)
+	// 2. Save V2 entities
+	entities := v.ListEntities()
+	sort.Slice(entities, func(i, j int) bool {
+		return entities[i].ID < entities[j].ID
+	})
+
+	for _, env := range entities {
+		data, err := json.MarshalIndent(env, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		envPath := filepath.Join(entitiesDir, env.ID+".json")
+		if err := fsutil.WriteFileAtomic(envPath, data, 0600); err != nil {
+			return nil, fmt.Errorf("failed writing snapshot entity %s: %w", env.ID, err)
+		}
+	}
+
+	stateFp := model.ComputeV2StateRoot(entities)
+	if len(entities) == 0 {
+		var totalFingerprints string
+		for _, art := range artifacts {
+			totalFingerprints += art.ID + ":" + art.Fingerprint + "|"
+		}
+		stateFp = model.ComputeFingerprint(model.KindMemory, model.ScopeGlobal, "vault_state", totalFingerprints, nil)
+	}
 
 	meta := &SnapshotMetadata{
 		SnapshotID:            snapID,
 		CreatedAt:             time.Now(),
 		VaultID:               v.Metadata.VaultID,
 		ArtifactCount:         len(artifacts),
+		EntityCount:           len(entities),
 		Reason:                reason,
 		VaultStateFingerprint: stateFp,
 	}
@@ -131,55 +160,82 @@ func (m *Manager) ListSnapshots() ([]*SnapshotMetadata, error) {
 	return res, nil
 }
 
-// RestoreSnapshot restores vault artifacts state from a snapshot using transactional staging.
+// RestoreSnapshot restores vault artifacts and V2 entities state from a snapshot using transactional staging.
 func (m *Manager) RestoreSnapshot(v *vault.Vault, snapshotID string) error {
 	snapDir := filepath.Join(m.cfg.SnapshotsDir, snapshotID)
 	artifactsDir := filepath.Join(snapDir, "artifacts")
+	entitiesDir := filepath.Join(snapDir, "entities")
 
-	if _, err := os.Stat(artifactsDir); os.IsNotExist(err) {
+	if _, err := os.Stat(snapDir); os.IsNotExist(err) {
 		return ErrSnapshotNotFound
 	}
 
-	// 1. Read and validate all snapshot artifacts into memory first
-	entries, err := os.ReadDir(artifactsDir)
-	if err != nil {
-		return err
+	// 1. Read staged V1 artifacts
+	stagedArtifacts := make([]*model.Artifact, 0)
+	if entries, err := os.ReadDir(artifactsDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(artifactsDir, entry.Name()))
+			if err != nil {
+				return fmt.Errorf("failed reading snapshot artifact %s: %w", entry.Name(), err)
+			}
+			art := &model.Artifact{}
+			if err := json.Unmarshal(data, art); err != nil {
+				return fmt.Errorf("failed parsing snapshot artifact %s: %w", entry.Name(), err)
+			}
+			stagedArtifacts = append(stagedArtifacts, art)
+		}
 	}
 
-	stagedArtifacts := make([]*model.Artifact, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
+	// 2. Read staged V2 entities
+	stagedEntities := make([]*model.EnvelopeV2, 0)
+	if entries, err := os.ReadDir(entitiesDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(entitiesDir, entry.Name()))
+			if err != nil {
+				return fmt.Errorf("failed reading snapshot entity %s: %w", entry.Name(), err)
+			}
+			env := &model.EnvelopeV2{}
+			if err := json.Unmarshal(data, env); err != nil {
+				return fmt.Errorf("failed parsing snapshot entity %s: %w", entry.Name(), err)
+			}
+			stagedEntities = append(stagedEntities, env)
 		}
-		data, err := os.ReadFile(filepath.Join(artifactsDir, entry.Name()))
-		if err != nil {
-			return fmt.Errorf("failed reading snapshot artifact %s: %w", entry.Name(), err)
-		}
-		art := &model.Artifact{}
-		if err := json.Unmarshal(data, art); err != nil {
-			return fmt.Errorf("failed parsing snapshot artifact %s: %w", entry.Name(), err)
-		}
-		if err := art.Validate(); err != nil {
-			return fmt.Errorf("snapshot artifact %s validation failed: %w", entry.Name(), err)
-		}
-		stagedArtifacts = append(stagedArtifacts, art)
 	}
-
-	// 2. Create safety backup snapshot before applying restoration
-	_, _ = m.CreateSnapshot(v, "Pre-restore safety backup")
 
 	// 3. Perform atomic transaction restore
 	tx := v.BeginTx()
-	currentArtifacts := v.ListArtifacts()
-	for _, art := range currentArtifacts {
+
+	// Clear current V1 artifacts and V2 entities
+	for _, art := range v.ListArtifacts() {
 		if err := tx.DeleteArtifact(art.ID); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 	}
+	for _, env := range v.ListEntities() {
+		if err := tx.DeleteEntity(env.ID); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
 
+	// Save staged V1 artifacts
 	for _, art := range stagedArtifacts {
 		if err := tx.SaveArtifact(art); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+
+	// Save staged V2 entities
+	for _, env := range stagedEntities {
+		if err := tx.SaveEntity(env); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

@@ -378,3 +378,115 @@ func TestVaultKeyRecipientCompatibility(t *testing.T) {
 		t.Fatalf("expected LoadOpen with different key to fail recipient mismatch check")
 	}
 }
+
+func TestVaultV2Immutability(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	env := &model.EnvelopeV2{
+		ID:            model.GenerateEntityID("apm"),
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Immutability Test Statement",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	env.RevisionHash = model.ComputeRevisionHash(env)
+
+	// 1. Input immutability
+	if err := v.SaveEntity(env); err != nil {
+		t.Fatalf("SaveEntity failed: %v", err)
+	}
+	env.Memory.Statement = "MUTATED STATEMENT OUTSIDE VAULT"
+
+	retrieved, ok := v.GetEntity(env.ID)
+	if !ok {
+		t.Fatalf("GetEntity failed")
+	}
+	if retrieved.Memory.Statement != "Immutability Test Statement" {
+		t.Errorf("vault internal state mutated by external input struct mutation! got: %s", retrieved.Memory.Statement)
+	}
+
+	// 2. Output immutability
+	retrieved.Memory.Statement = "MUTATED OUTPUT STRUCT"
+	retrieved2, _ := v.GetEntity(env.ID)
+	if retrieved2.Memory.Statement != "Immutability Test Statement" {
+		t.Errorf("vault internal state mutated by external output struct mutation! got: %s", retrieved2.Memory.Statement)
+	}
+
+	// 3. Slice immutability
+	entities := v.ListEntities()
+	entities[0].Memory.Statement = "MUTATED SLICE ELEMENT"
+	retrieved3, _ := v.GetEntity(env.ID)
+	if retrieved3.Memory.Statement != "Immutability Test Statement" {
+		t.Errorf("vault internal state mutated by ListEntities slice mutation!")
+	}
+}
+
+func TestTombstoneLoopPrevention(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	env := &model.EnvelopeV2{
+		ID:            "apm_tombstone_test_123",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "To be soft-deleted by remote tombstone",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 8,
+			Confidence: 1.0,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	env.RevisionHash = model.ComputeRevisionHash(env)
+	_ = v.SaveEntity(env)
+
+	remoteTS := &model.Tombstone{
+		EntityID:             env.ID,
+		PreviousRevisionHash: env.RevisionHash,
+		DeletedAt:            time.Now(),
+	}
+
+	// Apply remote tombstone locally once
+	if err := v.ApplyRemoteTombstone(remoteTS); err != nil {
+		t.Fatalf("ApplyRemoteTombstone failed: %v", err)
+	}
+
+	// Verify entity is removed locally
+	if _, exists := v.GetEntity(env.ID); exists {
+		t.Errorf("expected entity to be deleted after applying remote tombstone")
+	}
+
+	t1, _ := v.ListTombstones()
+	firstCount := len(t1)
+
+	// Re-applying the exact same remote tombstone must be idempotent and not create duplicate tombstones
+	if err := v.ApplyRemoteTombstone(remoteTS); err != nil {
+		t.Fatalf("second ApplyRemoteTombstone failed: %v", err)
+	}
+
+	t2, _ := v.ListTombstones()
+	secondCount := len(t2)
+	if secondCount != firstCount {
+		t.Errorf("expected tombstone list length unchanged on re-applying remote tombstone (%d), got %d (infinite tombstone loop!)", firstCount, secondCount)
+	}
+}

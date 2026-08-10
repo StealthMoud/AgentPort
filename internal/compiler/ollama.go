@@ -91,7 +91,7 @@ func (b *LocalOllamaBackend) Analyze(ctx context.Context, req *AnalysisRequest) 
 
 	var analysisResp AnalysisResponse
 	if err := json.Unmarshal([]byte(ollamaResp.Response), &analysisResp); err != nil {
-		return nil, fmt.Errorf("%w: failed parsing Ollama JSON response: %v (raw: %s)", ErrInvalidModelOutput, err, ollamaResp.Response)
+		return nil, fmt.Errorf("%w: invalid structured model output backend=ollama model=%s parse_error=%T", ErrInvalidModelOutput, b.model, err)
 	}
 
 	return &analysisResp, nil

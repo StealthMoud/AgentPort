@@ -102,8 +102,40 @@ func (b *TestBackend) Health(ctx context.Context) error {
 
 func (b *TestBackend) Analyze(ctx context.Context, req *AnalysisRequest) (*AnalysisResponse, error) {
 	proposals := make([]*Proposal, 0)
+	analyzedCount := len(req.Artifacts) + len(req.Entities)
 
-	// Deterministic duplicate detection check across items with identical content
+	// 1. V2 entities analysis
+	seenV2Content := make(map[string]*model.EnvelopeV2)
+	for _, env := range req.Entities {
+		if env.Memory == nil {
+			continue
+		}
+		norm := model.NormalizeContent(env.Memory.Statement)
+		if first, exists := seenV2Content[norm]; exists {
+			prop := &Proposal{
+				ID:                  model.GenerateEntityID("prop"),
+				ProposalSetID:       model.GenerateEntityID("propset"),
+				Operation:           OpMerge,
+				TargetIDs:           []string{first.ID, env.ID},
+				BeforeState:         fmt.Sprintf("A: %s\nB: %s", first.Memory.Statement, env.Memory.Statement),
+				ProposedState:       first.Memory.Statement,
+				Rationale:           "Deterministic duplicate memory content detected across V2 entities",
+				Confidence:          1.0,
+				Backend:             b.Name(),
+				Model:               "test-fake",
+				PromptVersion:       "v2.0",
+				InputStateRoot:      req.InputStateRoot,
+				CreatedAt:           time.Now(),
+				Status:              ProposalStatusPending,
+				EstimatedTokenDelta: -len(env.Memory.Statement) / 4,
+			}
+			proposals = append(proposals, prop)
+		} else {
+			seenV2Content[norm] = env
+		}
+	}
+
+	// 2. Legacy V1 artifacts fallback
 	seenContent := make(map[string]*model.Artifact)
 	for _, art := range req.Artifacts {
 		norm := model.NormalizeContent(art.Content)
@@ -134,7 +166,7 @@ func (b *TestBackend) Analyze(ctx context.Context, req *AnalysisRequest) (*Analy
 	return &AnalysisResponse{
 		Proposals: proposals,
 		Metrics: &Metrics{
-			AnalyzedCount:      len(req.Artifacts),
+			AnalyzedCount:      analyzedCount,
 			DuplicateProposals: len(proposals),
 		},
 	}, nil
