@@ -2,10 +2,13 @@ package crypt
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"filippo.io/age"
@@ -16,6 +19,8 @@ var (
 	ErrInvalidKey       = errors.New("invalid age key")
 	ErrDecryptionFailed = errors.New("decryption failed - wrong identity or corrupt data")
 	ErrMissingIdentity  = errors.New("encryption identity missing")
+	ErrNoRecipients     = errors.New("no recipients provided")
+	ErrInvalidRecipient = errors.New("invalid age recipient")
 )
 
 // KeyPair represents Age private identity and public recipient.
@@ -66,8 +71,36 @@ func LoadIdentityFromFile(path string) (*KeyPair, error) {
 
 // Encrypt encrypts plaintext data using an Age recipient.
 func Encrypt(recipient age.Recipient, plaintext []byte) ([]byte, error) {
+	return EncryptToRecipients([]age.Recipient{recipient}, plaintext)
+}
+
+// EncryptToRecipients encrypts plaintext data using one or more Age recipients.
+// Rejects zero recipients, invalid/nil recipients, and deduplicates identical recipients.
+func EncryptToRecipients(recipients []age.Recipient, plaintext []byte) ([]byte, error) {
+	if len(recipients) == 0 {
+		return nil, ErrNoRecipients
+	}
+
+	dedup := make([]age.Recipient, 0, len(recipients))
+	seen := make(map[string]bool)
+
+	for _, r := range recipients {
+		if r == nil {
+			return nil, ErrInvalidRecipient
+		}
+		str := fmt.Sprintf("%v", r)
+		if !seen[str] {
+			seen[str] = true
+			dedup = append(dedup, r)
+		}
+	}
+
+	if len(dedup) == 0 {
+		return nil, ErrNoRecipients
+	}
+
 	var buf bytes.Buffer
-	w, err := age.Encrypt(&buf, recipient)
+	w, err := age.Encrypt(&buf, dedup...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize age encryption: %w", err)
 	}
@@ -81,6 +114,19 @@ func Encrypt(recipient age.Recipient, plaintext []byte) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// RecipientSetHash returns a deterministic SHA-256 digest of sorted public recipient strings.
+func RecipientSetHash(recipients []string) string {
+	if len(recipients) == 0 {
+		return ""
+	}
+	cp := make([]string, len(recipients))
+	copy(cp, recipients)
+	sort.Strings(cp)
+	joined := strings.Join(cp, "\n")
+	sum := sha256.Sum256([]byte(joined))
+	return hex.EncodeToString(sum[:])
 }
 
 // Decrypt decrypts ciphertext data using an Age identity.
