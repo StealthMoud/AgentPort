@@ -8,6 +8,9 @@ import (
 	"github.com/StealthMoud/AgentPort/internal/compiler"
 	"github.com/StealthMoud/AgentPort/internal/config"
 	"github.com/StealthMoud/AgentPort/internal/governance"
+	"github.com/StealthMoud/AgentPort/internal/model"
+	"github.com/StealthMoud/AgentPort/internal/snapshot"
+	"github.com/StealthMoud/AgentPort/internal/vault"
 )
 
 func TestAuditJournalAndProposalStore(t *testing.T) {
@@ -75,5 +78,55 @@ func TestAuditJournalAndProposalStore(t *testing.T) {
 	allProps, err := ps.ListProposals()
 	if err != nil || len(allProps) != 1 {
 		t.Fatalf("ListProposals expected 1 item, got %d (err: %v)", len(allProps), err)
+	}
+}
+
+func TestProposalUndoRestoresState(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	origArt := &model.Artifact{
+		SchemaVersion: model.SchemaVersionV1,
+		Kind:          model.KindMemory,
+		Scope:         model.ScopeGlobal,
+		Title:         "Pre-Proposal Memory",
+		Content:       "Original State Before Proposal",
+	}
+	_ = v.SaveArtifact(origArt)
+
+	// Create snapshot
+	snapMgr := snapshot.NewManager(cfg)
+	snap, err := snapMgr.CreateSnapshot(v, "pre_apply")
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	// Mutate state (simulating proposal application)
+	_ = v.DeleteArtifact(origArt.ID)
+	newArt := &model.Artifact{
+		SchemaVersion: model.SchemaVersionV1,
+		Kind:          model.KindMemory,
+		Scope:         model.ScopeGlobal,
+		Title:         "Applied Memory",
+		Content:       "Mutated State After Proposal",
+	}
+	_ = v.SaveArtifact(newArt)
+
+	// Perform Undo restoring snapshot
+	if err := snapMgr.RestoreSnapshot(v, snap.SnapshotID); err != nil {
+		t.Fatalf("RestoreSnapshot failed: %v", err)
+	}
+
+	reopened, _ := vault.LoadOpen(cfg)
+	item, ok := reopened.GetArtifact(origArt.ID)
+	if !ok || item.Content != "Original State Before Proposal" {
+		t.Fatalf("undo failed to restore original state!")
 	}
 }

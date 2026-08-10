@@ -99,12 +99,26 @@ func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope mod
 		}
 	}
 
+	entities := v.ListEntities()
+	filteredEntities := make([]*model.EnvelopeV2, 0, len(entities))
+	for _, env := range entities {
+		if env.Sensitivity == model.SensitivitySecret {
+			continue
+		}
+		if scope != "" && env.Scope != scope {
+			continue
+		}
+		filteredEntities = append(filteredEntities, env)
+		validIDs[env.ID] = true
+	}
+
 	stateRoot := ComputeStateRoot(filtered)
 
 	req := &AnalysisRequest{
 		Scope:          scope,
 		InputStateRoot: stateRoot,
 		Artifacts:      filtered,
+		Entities:       filteredEntities,
 	}
 
 	res, err := mc.backend.Analyze(ctx, req)

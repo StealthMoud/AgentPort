@@ -263,6 +263,77 @@ func TestVaultTransactionFaultInjection(t *testing.T) {
 	}
 }
 
+func TestTransactionAtomicFailureDuringFinalSwap(t *testing.T) {
+	swapPhases := []string{
+		"pre_staging",
+		"during_write",
+		"after_writes",
+		"during_delete",
+		"pre_swap",
+		"after_backup_rename",
+		"during_final_swap",
+	}
+
+	for _, phase := range swapPhases {
+		t.Run("SwapFault_"+phase, func(t *testing.T) {
+			tempDir := t.TempDir()
+			homeDir := filepath.Join(tempDir, "home")
+			vaultDir := filepath.Join(tempDir, "vault")
+
+			t.Setenv(config.EnvAppHome, homeDir)
+			t.Setenv(config.EnvVaultDir, vaultDir)
+
+			cfg, _ := config.Load()
+			v, _ := vault.Initialize(cfg)
+
+			origArt := &model.Artifact{
+				SchemaVersion: model.SchemaVersionV1,
+				Kind:          model.KindMemory,
+				Scope:         model.ScopeGlobal,
+				Title:         "Original Vault Item",
+				Content:       "Initial State",
+			}
+			_ = v.SaveArtifact(origArt)
+
+			tx := v.BeginTx()
+			newArt := &model.Artifact{
+				SchemaVersion: model.SchemaVersionV1,
+				Kind:          model.KindInstruction,
+				Scope:         model.ScopeGlobal,
+				Title:         "Atomic Swap Item",
+				Content:       "Should Never Persist On Failure",
+			}
+			_ = tx.SaveArtifact(newArt)
+			_ = tx.DeleteArtifact(origArt.ID)
+
+			err := tx.CommitWithFaultHook(func(p string) error {
+				if p == phase {
+					return fmt.Errorf("injected swap fault at %s", p)
+				}
+				return nil
+			})
+
+			if err == nil {
+				t.Fatalf("expected commit error for swap fault phase %s", phase)
+			}
+
+			// Reopen vault from disk after simulated fault to verify crash recovery
+			reopenedVault, err := vault.LoadOpen(cfg)
+			if err != nil {
+				t.Fatalf("vault failed to reopen from disk after fault phase %s: %v", phase, err)
+			}
+
+			item, exists := reopenedVault.GetArtifact(origArt.ID)
+			if !exists || item.Content != "Initial State" {
+				t.Fatalf("reopened vault disk state corrupted at swap fault phase %s!", phase)
+			}
+			if _, newExists := reopenedVault.GetArtifact(newArt.ID); newExists {
+				t.Fatalf("new artifact leaked to disk despite transaction failure at phase %s", phase)
+			}
+		})
+	}
+}
+
 func TestVaultKeyRecipientCompatibility(t *testing.T) {
 	tempDir := t.TempDir()
 	homeDir := filepath.Join(tempDir, "agentport_home")

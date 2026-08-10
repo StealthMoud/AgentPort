@@ -87,3 +87,64 @@ func TestContextCompilerDeterminismAndCategoryBudgets(t *testing.T) {
 		t.Errorf("expected identical state root, got %s vs %s", m1.StateRoot, m2.StateRoot)
 	}
 }
+
+func TestContextCompilerEstimatorLabel(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	cc := contextpkg.NewContextCompiler(nil)
+	caps := adapter.Capabilities{Instructions: adapter.SupportFull}
+
+	m, err := cc.Compile(ctx, v, "codex", caps)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	if m.Estimator != "generic_char4" {
+		t.Errorf("expected estimator label 'generic_char4', got %s", m.Estimator)
+	}
+}
+
+func TestContextCompilerCategoryBudgets(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	// Save oversized instruction exceeding budget
+	art := &model.Artifact{
+		SchemaVersion: model.SchemaVersionV1,
+		Kind:          model.KindInstruction,
+		Scope:         model.ScopeGlobal,
+		Title:         "Oversized Instruction",
+		Content:       "Very long instruction content string that exceeds the tight category token budget cap...",
+	}
+	_ = v.SaveArtifact(art)
+
+	budget := &contextpkg.TokenBudget{
+		MaxTokens:       1000,
+		InstructionsCap: 2, // 2 token cap (~8 chars)
+	}
+
+	cc := contextpkg.NewContextCompiler(budget)
+	caps := adapter.Capabilities{Instructions: adapter.SupportFull}
+
+	m, err := cc.Compile(ctx, v, "codex", caps)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	if len(m.Items) != 1 || m.Items[0].Included {
+		t.Errorf("expected oversized instruction item to be excluded due to category budget cap")
+	}
+}

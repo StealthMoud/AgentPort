@@ -1024,75 +1024,161 @@ func newMemoryCmd() *cobra.Command {
 			}
 
 			ps := governance.NewProposalStore(cfg)
-			var targetProp *compiler.Proposal
+			var targetProps []*compiler.Proposal
 
 			if len(args) > 0 {
 				p, ok := ps.GetProposal(args[0])
 				if !ok {
 					return fmt.Errorf("proposal %s not found", args[0])
 				}
-				targetProp = p
+				targetProps = append(targetProps, p)
 			} else if setFlag != "" {
 				props, _ := ps.ListProposals()
 				for _, p := range props {
 					if p.ProposalSetID == setFlag {
-						targetProp = p
-						break
+						targetProps = append(targetProps, p)
 					}
 				}
 			}
 
-			if targetProp == nil {
-				return fmt.Errorf("proposal ID or --set flag is required")
+			if len(targetProps) == 0 {
+				return fmt.Errorf("proposal ID or valid --set flag is required")
 			}
 
-			// State-root safety check: state root must match
-			currentStateRoot := compiler.ComputeStateRoot(v.ListArtifacts())
-			if targetProp.InputStateRoot != "" && targetProp.InputStateRoot != currentStateRoot {
-				return fmt.Errorf("stale proposal rejected: proposal state root (%s) != current vault state root (%s)", targetProp.InputStateRoot, currentStateRoot)
+			// 1. Create pre-apply backup snapshot for genuine atomic undo capability
+			snapMgr := snapshot.NewManager(cfg)
+			snap, snapErr := snapMgr.CreateSnapshot(v, "pre_governance_apply")
+			snapID := ""
+			if snapErr == nil {
+				snapID = snap.SnapshotID
 			}
 
-			// Apply proposal transactionally
+			// 2. Single atomic transaction for all proposals in set
 			tx := v.BeginTx()
-			if targetProp.Operation == compiler.OpCreate || targetProp.Operation == compiler.OpRefine {
-				newArt := &model.Artifact{
-					SchemaVersion: model.SchemaVersionV1,
-					Kind:          model.KindMemory,
-					Scope:         model.ScopeGlobal,
-					Title:         "Compiler Memory",
-					Content:       targetProp.ProposedState,
-					Sensitivity:   model.SensitivityNormal,
+			for _, prop := range targetProps {
+				// State-root safety check
+				currentStateRoot := compiler.ComputeStateRoot(v.ListArtifacts())
+				if prop.InputStateRoot != "" && prop.InputStateRoot != currentStateRoot {
+					_ = tx.Rollback()
+					return fmt.Errorf("stale proposal %s rejected: proposal state root (%s) != current vault state root (%s)", prop.ID, prop.InputStateRoot, currentStateRoot)
 				}
-				if err := tx.SaveArtifact(newArt); err != nil {
-					return err
-				}
-			} else if targetProp.Operation == compiler.OpArchive || targetProp.Operation == compiler.OpSupersede {
-				for _, id := range targetProp.TargetIDs {
-					_ = tx.DeleteArtifact(id)
+
+				switch prop.Operation {
+				case compiler.OpCreate:
+					env := &model.EnvelopeV2{
+						ID:            model.GenerateEntityID("apm"),
+						SchemaVersion: model.SchemaVersionV2,
+						Kind:          model.KindMemoryV2,
+						Scope:         model.ScopeGlobal,
+						Memory: &model.MemoryPayload{
+							Statement:  prop.ProposedState,
+							Category:   model.CategoryWorkflow,
+							Status:     model.MemoryStatusActive,
+							Importance: 8,
+							Confidence: prop.Confidence,
+							Derivation: model.DerivationSummarized,
+						},
+					}
+					if err := tx.SaveEntity(env); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+				case compiler.OpMerge, compiler.OpSupersede:
+					for _, tid := range prop.TargetIDs {
+						_ = tx.DeleteArtifact(tid)
+					}
+					env := &model.EnvelopeV2{
+						ID:            model.GenerateEntityID("apm"),
+						SchemaVersion: model.SchemaVersionV2,
+						Kind:          model.KindMemoryV2,
+						Scope:         model.ScopeGlobal,
+						Memory: &model.MemoryPayload{
+							Statement:  prop.ProposedState,
+							Category:   model.CategoryWorkflow,
+							Status:     model.MemoryStatusActive,
+							Importance: 8,
+							Confidence: prop.Confidence,
+							Derivation: model.DerivationSummarized,
+						},
+					}
+					if err := tx.SaveEntity(env); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+				case compiler.OpRefine, compiler.OpReclassify:
+					for _, tid := range prop.TargetIDs {
+						if existing, ok := v.GetEntity(tid); ok {
+							existing.Memory.Statement = prop.ProposedState
+							_ = tx.SaveEntity(existing)
+						}
+					}
+				case compiler.OpArchive:
+					for _, tid := range prop.TargetIDs {
+						_ = tx.DeleteArtifact(tid)
+					}
+				case compiler.OpMarkConflict, compiler.OpMarkStale:
+					for _, tid := range prop.TargetIDs {
+						if existing, ok := v.GetEntity(tid); ok {
+							existing.Memory.Status = model.MemoryStatusSuperseded
+							_ = tx.SaveEntity(existing)
+						}
+					}
 				}
 			}
 
 			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("failed committing proposal application: %w", err)
+				return fmt.Errorf("failed committing proposal set application: %w", err)
 			}
 
-			targetProp.Status = compiler.ProposalStatusAccepted
-			_ = ps.SaveProposal(targetProp)
-
+			// Mark proposals accepted and log audit events with snapshot reference
 			j := governance.NewJournal(cfg)
-			_ = j.RecordEvent(&governance.AuditEvent{
-				Actor:      "memory_compiler",
-				Operation:  string(targetProp.Operation),
-				ProposalID: targetProp.ID,
-				TargetID:   targetProp.ID,
-			})
+			for _, prop := range targetProps {
+				prop.Status = compiler.ProposalStatusAccepted
+				_ = ps.SaveProposal(prop)
+				_ = j.RecordEvent(&governance.AuditEvent{
+					Actor:      "memory_compiler",
+					Operation:  string(prop.Operation),
+					ProposalID: prop.ID,
+					TargetID:   prop.ID,
+					SnapshotID: snapID,
+				})
+			}
 
-			fmt.Printf("✓ Proposal %s successfully applied!\n", targetProp.ID)
+			fmt.Printf("✓ Applied %d proposals successfully!\n", len(targetProps))
 			return nil
 		},
 	}
 	applyCmd.Flags().StringVar(&setFlag, "set", "", "Apply entire proposal set by set ID")
 	cmd.AddCommand(applyCmd)
+
+	cmd.AddCommand(&cobra.Command{
+		Use:   "review",
+		Short: "Review pending proposal sets from Memory Compiler",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			ps := governance.NewProposalStore(cfg)
+			props, err := ps.ListProposals()
+			if err != nil {
+				return err
+			}
+			pendingCount := 0
+			fmt.Println("Pending Governance Proposal Sets")
+			fmt.Println()
+			for _, p := range props {
+				if p.Status == compiler.ProposalStatusPending {
+					pendingCount++
+					fmt.Printf("  • ID: %s | Set: %s | Op: %s | Conf: %.2f\n    Rationale: %s\n\n", p.ID, p.ProposalSetID, p.Operation, p.Confidence, p.Rationale)
+				}
+			}
+			if pendingCount == 0 {
+				fmt.Println("Zero pending proposal sets requiring review.")
+			}
+			return nil
+		},
+	})
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "reject <proposal-id>",
@@ -1148,13 +1234,18 @@ func newMemoryCmd() *cobra.Command {
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "undo <event-id>",
-		Short: "Undo a previous canonical state mutation and log an audit event",
+		Short: "Undo a previous canonical state mutation and restore snapshot state",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
 			if err != nil {
 				return err
 			}
+			v, err := vault.LoadOpen(cfg)
+			if err != nil {
+				return err
+			}
+
 			j := governance.NewJournal(cfg)
 			events, err := j.ListEvents()
 			if err != nil {
@@ -1172,13 +1263,21 @@ func newMemoryCmd() *cobra.Command {
 				return fmt.Errorf("audit event %s not found", args[0])
 			}
 
+			if targetEvt.SnapshotID != "" {
+				snapMgr := snapshot.NewManager(cfg)
+				if err := snapMgr.RestoreSnapshot(v, targetEvt.SnapshotID); err != nil {
+					return fmt.Errorf("failed restoring snapshot %s for undo: %w", targetEvt.SnapshotID, err)
+				}
+			}
+
 			_ = j.RecordEvent(&governance.AuditEvent{
-				Actor:     "user",
-				Operation: "UNDO_" + targetEvt.Operation,
-				TargetID:  targetEvt.TargetID,
+				Actor:      "user",
+				Operation:  "UNDO_" + targetEvt.Operation,
+				TargetID:   targetEvt.TargetID,
+				SnapshotID: targetEvt.SnapshotID,
 			})
 
-			fmt.Printf("✓ Successfully recorded undo audit event for %s (%s)\n", targetEvt.EventID, targetEvt.Operation)
+			fmt.Printf("✓ Event %s undone and state restored successfully!\n", targetEvt.EventID)
 			return nil
 		},
 	})

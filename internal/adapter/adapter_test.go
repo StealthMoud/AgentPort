@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/StealthMoud/AgentPort/internal/adapter"
 	"github.com/StealthMoud/AgentPort/internal/adapter/claude"
 	"github.com/StealthMoud/AgentPort/internal/adapter/codex"
 	"github.com/StealthMoud/AgentPort/internal/adapter/gemini"
+	"github.com/StealthMoud/AgentPort/internal/model"
 )
 
 func TestAdaptersDetectionScanningImportExport(t *testing.T) {
@@ -106,5 +108,96 @@ func TestMaliciousMarkdownIgnoredByExplicitSurfaceScanners(t *testing.T) {
 	}
 	if scanRes.UnsupportedIgnored != 1 {
 		t.Errorf("expected 1 ignored artifact (random_malicious.md), got %d", scanRes.UnsupportedIgnored)
+	}
+}
+
+func TestCodexSkillImportsAsSkillPackage(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	skillDir := filepath.Join(root, "skills", "test_skill")
+	_ = os.MkdirAll(skillDir, 0700)
+	_ = os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("# Test Skill\nDescription of skill."), 0600)
+
+	codexAd := codex.New(root)
+	v2Envs, err := codexAd.ImportV2(ctx, "apm_test_machine", nil)
+	if err != nil {
+		t.Fatalf("ImportV2 failed: %v", err)
+	}
+
+	if len(v2Envs) != 1 {
+		t.Fatalf("expected 1 V2 envelope, got %d", len(v2Envs))
+	}
+	if v2Envs[0].Kind != model.KindSkillPackage {
+		t.Fatalf("expected KindSkillPackage, got %s", v2Envs[0].Kind)
+	}
+	if v2Envs[0].Skill == nil || v2Envs[0].Skill.SkillMD == "" {
+		t.Errorf("expected SkillPackage payload with SkillMD content")
+	}
+}
+
+func TestCodexAgentImportsAsAgentDef(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	agentDir := filepath.Join(root, "agents")
+	_ = os.MkdirAll(agentDir, 0700)
+	_ = os.WriteFile(filepath.Join(agentDir, "helper.toml"), []byte(`name = "helper"`), 0600)
+
+	codexAd := codex.New(root)
+	v2Envs, err := codexAd.ImportV2(ctx, "apm_test_machine", nil)
+	if err != nil {
+		t.Fatalf("ImportV2 failed: %v", err)
+	}
+
+	if len(v2Envs) != 1 {
+		t.Fatalf("expected 1 V2 envelope, got %d", len(v2Envs))
+	}
+	if v2Envs[0].Kind != model.KindAgentDef {
+		t.Fatalf("expected KindAgentDef, got %s", v2Envs[0].Kind)
+	}
+}
+
+func TestMCPSecretsStripped(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "mcp.json"), []byte(`{"command":"npx","args":["-y","server"],"env":{"API_KEY":"secret_token"}}`), 0600)
+
+	codexAd := codex.New(root)
+	v2Envs, err := codexAd.ImportV2(ctx, "apm_test_machine", nil)
+	if err != nil {
+		t.Fatalf("ImportV2 failed: %v", err)
+	}
+
+	if len(v2Envs) != 1 {
+		t.Fatalf("expected 1 V2 envelope, got %d", len(v2Envs))
+	}
+	if v2Envs[0].Kind != model.KindMCPToolDef {
+		t.Fatalf("expected KindMCPToolDef, got %s", v2Envs[0].Kind)
+	}
+}
+
+func TestWorkspaceScopesProviderSurfaces(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	wsDir := filepath.Join(root, "my_project")
+	_ = os.MkdirAll(wsDir, 0700)
+	_ = os.WriteFile(filepath.Join(wsDir, "AGENTS.md"), []byte("Project-specific instruction."), 0600)
+
+	opCtx := &adapter.OperationContext{
+		WorkspacePath: wsDir,
+		ProjectID:     "proj_123",
+		Scope:         model.ScopeProject,
+	}
+
+	codexAd := codex.New(wsDir)
+	v2Envs, err := codexAd.ImportV2(ctx, "apm_test_machine", opCtx)
+	if err != nil {
+		t.Fatalf("ImportV2 failed: %v", err)
+	}
+
+	if len(v2Envs) != 1 {
+		t.Fatalf("expected 1 V2 envelope, got %d", len(v2Envs))
+	}
+	if v2Envs[0].Scope != model.ScopeProject || v2Envs[0].ProjectID != "proj_123" {
+		t.Errorf("expected ScopeProject and ProjectID proj_123, got Scope %s and ProjectID %s", v2Envs[0].Scope, v2Envs[0].ProjectID)
 	}
 }

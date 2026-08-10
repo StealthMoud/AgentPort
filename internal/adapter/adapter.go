@@ -79,12 +79,19 @@ type Capabilities struct {
 	ProjectRules FeatureSupport `json:"project_rules"`
 }
 
+type OperationContext struct {
+	WorkspacePath string      `json:"workspace_path"`
+	ProjectID     string      `json:"project_id"`
+	Scope         model.Scope `json:"scope"`
+}
+
 type Adapter interface {
 	Name() string
 	Detect(ctx context.Context) (*DetectResult, error)
 	Capabilities() Capabilities
 	Scan(ctx context.Context) (*ScanResult, error)
 	Import(ctx context.Context, machineID string) ([]*model.Artifact, error)
+	ImportV2(ctx context.Context, machineID string, opCtx *OperationContext) ([]*model.EnvelopeV2, error)
 	PlanExport(ctx context.Context, artifacts []*model.Artifact) (*ExportPlan, error)
 	ApplyExport(ctx context.Context, plan *ExportPlan) (*ExportResult, error)
 	Validate(ctx context.Context) error

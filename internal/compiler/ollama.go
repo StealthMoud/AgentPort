@@ -91,11 +91,7 @@ func (b *LocalOllamaBackend) Analyze(ctx context.Context, req *AnalysisRequest) 
 
 	var analysisResp AnalysisResponse
 	if err := json.Unmarshal([]byte(ollamaResp.Response), &analysisResp); err != nil {
-		// Fallback empty proposal set if parse fails
-		return &AnalysisResponse{
-			Proposals: []*Proposal{},
-			Metrics:   &Metrics{AnalyzedCount: len(req.Artifacts)},
-		}, nil
+		return nil, fmt.Errorf("%w: failed parsing Ollama JSON response: %v (raw: %s)", ErrInvalidModelOutput, err, ollamaResp.Response)
 	}
 
 	return &analysisResp, nil

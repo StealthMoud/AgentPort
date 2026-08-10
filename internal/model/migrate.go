@@ -1,6 +1,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 )
 
@@ -9,7 +11,7 @@ type MigrationPlan struct {
 	ConvertedV2      []*EnvelopeV2 `json:"converted_v2"`
 }
 
-// MigrateV1ToV2 converts a slice of V1 Artifacts into Schema V2 Envelopes deterministically.
+// MigrateV1ToV2 converts a slice of V1 Artifacts into Schema V2 Envelopes deterministically using immutable legacy IDs.
 func MigrateV1ToV2(v1Arts []*Artifact) (*MigrationPlan, error) {
 	plan := &MigrationPlan{
 		V1ArtifactsCount: len(v1Arts),
@@ -21,13 +23,15 @@ func MigrateV1ToV2(v1Arts []*Artifact) (*MigrationPlan, error) {
 			return nil, fmt.Errorf("invalid v1 artifact %s: %w", art.ID, err)
 		}
 
-		v2ID := fmt.Sprintf("apv2_%s", art.Fingerprint[:16])
+		h := sha256.Sum256([]byte("agentport_v1_migration:" + art.ID))
+		v2ID := fmt.Sprintf("apv2_%s", hex.EncodeToString(h[:])[:16])
 
 		env := &EnvelopeV2{
 			ID:            v2ID,
 			SchemaVersion: SchemaVersionV2,
 			Kind:          EntityKind(art.Kind),
 			Scope:         art.Scope,
+			ProjectID:     art.Metadata["project_id"],
 			Revision:      1,
 			RevisionHash:  art.Fingerprint,
 			CreatedAt:     art.CreatedAt,
@@ -40,30 +44,28 @@ func MigrateV1ToV2(v1Arts []*Artifact) (*MigrationPlan, error) {
 		}
 
 		switch art.Kind {
-		case KindMemory, KindPreference:
+		case KindMemory, KindPreference, KindInstruction, KindProjectContext:
+			cat := CategoryUncategorized
+			prio := 5
+			if art.Kind == KindPreference {
+				cat = CategoryPreference
+			} else if art.Kind == KindInstruction {
+				cat = CategoryWorkflow
+				prio = 8
+			} else if art.Kind == KindProjectContext {
+				cat = CategoryProjectFact
+				prio = 7
+			}
+
 			env.Memory = &MemoryPayload{
 				Statement:       art.Content,
-				Category:        CategoryPreference,
+				Category:        cat,
 				Status:          MemoryStatusActive,
-				Importance:      5,
+				Importance:      prio,
 				Confidence:      1.0,
 				Derivation:      DerivationImported,
 				LastConfirmedAt: art.UpdatedAt,
 				ReviewState:     "approved",
-			}
-			if art.Kind == KindMemory {
-				env.Memory.Category = CategoryUncategorized
-			}
-		case KindInstruction, KindProjectContext:
-			env.SourceRecord = &SourceRecord{
-				ID:          fmt.Sprintf("aps_%s", art.Fingerprint[:16]),
-				ContentType: art.ContentType,
-				Content:     art.Content,
-				Files:       art.Files,
-				SourceHash:  art.Fingerprint,
-				ObservedAt:  art.UpdatedAt,
-				Revision:    1,
-				Status:      "present",
 			}
 		}
 

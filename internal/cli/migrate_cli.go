@@ -128,10 +128,17 @@ func newMigrateCmd() *cobra.Command {
 				return fmt.Errorf("migration plan failed: %w", err)
 			}
 
-			// 3. Staged transaction
+			// 3. Staged transaction: Save all V2 envelopes AND delete V1 artifacts
 			tx := v.BeginTx()
 			for _, art := range artifacts {
 				_ = tx.DeleteArtifact(art.ID)
+			}
+			for _, env := range plan.ConvertedV2 {
+				if err := tx.SaveEntity(env); err != nil {
+					_ = tx.Rollback()
+					_ = snapMgr.RestoreSnapshot(v, snap.SnapshotID)
+					return fmt.Errorf("migration envelope staging failed: %w", err)
+				}
 			}
 
 			if err := tx.Commit(); err != nil {
@@ -139,12 +146,19 @@ func newMigrateCmd() *cobra.Command {
 				return fmt.Errorf("failed migration transaction commit: %w", err)
 			}
 
-			// 4. Update vault schema version metadata
+			// 4. Reopen verification pass: verify reopened vault contains all V2 entities
+			reopenedVault, err := vault.LoadOpen(cfg)
+			if err != nil || len(reopenedVault.ListEntities()) < len(plan.ConvertedV2) {
+				_ = snapMgr.RestoreSnapshot(v, snap.SnapshotID)
+				return fmt.Errorf("migration reopen verification failed: expected %d V2 entities, got %d", len(plan.ConvertedV2), len(reopenedVault.ListEntities()))
+			}
+
+			// 5. Update vault schema version metadata
 			v.Metadata.SchemaVersion = model.SchemaVersionV2
 			metaBytes, _ := json.MarshalIndent(v.Metadata, "", "  ")
 			_ = fsutil.WriteFileAtomic(filepath.Join(cfg.VaultDir, "vault.json"), metaBytes, 0600)
 
-			// 5. Audit log event
+			// 6. Audit log event
 			j := governance.NewJournal(cfg)
 			_ = j.RecordEvent(&governance.AuditEvent{
 				Actor:     "migration",

@@ -179,24 +179,25 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 			if err != nil {
 				return nil, fmt.Errorf("failed checkout remote branch: %w", err)
 			}
-		} else {
+		} else if remoteURL != "" {
 			_, err := s.execGit(ctx, "pull", "--ff-only", "origin", "main")
 			if err != nil {
 				return nil, fmt.Errorf("failed fast-forward pull: %w", err)
 			}
 		}
-
-		decryptedCount, err := s.decryptObjectsIntoVault(v)
-		if err != nil {
-			return nil, fmt.Errorf("failed decrypting incoming remote objects: %w", err)
-		}
-		res.ObjectsDecryptedCount = decryptedCount
 	}
+
+	// 3. Decrypt incoming objects from sync repo into vault
+	decryptedCount, err := s.decryptObjectsIntoVault(v)
+	if err != nil {
+		return nil, fmt.Errorf("failed decrypting incoming remote objects: %w", err)
+	}
+	res.ObjectsDecryptedCount = decryptedCount
 
 	// 4. Load manifest from sync repo
 	manifestPath := filepath.Join(s.cfg.SyncRepoDir, "manifest.json")
 	manifest := &Manifest{
-		SchemaVersion: model.SchemaVersionV1,
+		SchemaVersion: v.Metadata.SchemaVersion,
 		VaultID:       v.Metadata.VaultID,
 		UpdatedAt:     time.Now(),
 		Objects:       make(map[string]*ManifestObject),
@@ -205,6 +206,7 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 	if data, err := os.ReadFile(manifestPath); err == nil {
 		_ = json.Unmarshal(data, manifest)
 	}
+	manifest.SchemaVersion = v.Metadata.SchemaVersion
 
 	objectsDir := filepath.Join(s.cfg.SyncRepoDir, "objects")
 	if err := os.MkdirAll(objectsDir, 0700); err != nil {
@@ -217,10 +219,49 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 		_ = fsutil.WriteFileAtomic(filepath.Join(s.cfg.SyncRepoDir, "vault.json"), vaultMetaBytes, 0600)
 	}
 
-	// 5. Encrypt changed local artifacts
-	artifacts := v.ListArtifacts()
+	// 5. Encrypt changed local artifacts and V2 entities
 	changedCount := 0
 
+	// V2 Envelopes Sync
+	entities := v.ListEntities()
+	for _, env := range entities {
+		if err := security.ValidateEnvelopeSecurity(env); err != nil {
+			return nil, fmt.Errorf("security check failed during sync for V2 entity %s: %w", env.ID, err)
+		}
+
+		existingObj, exists := manifest.Objects[env.ID]
+		if !exists || existingObj.Fingerprint != env.RevisionHash {
+			envBytes, err := json.MarshalIndent(env, "", "  ")
+			if err != nil {
+				return nil, err
+			}
+
+			ciphertext, err := crypt.Encrypt(v.Key.Recipient, envBytes)
+			if err != nil {
+				return nil, fmt.Errorf("failed encrypting V2 entity %s: %w", env.ID, err)
+			}
+
+			opaqueID := model.ComputeFingerprint(model.Kind(env.Kind), env.Scope, env.ID, env.RevisionHash, nil)[:24]
+			objectFileName := opaqueID + ".age"
+			objectPath := filepath.Join(objectsDir, objectFileName)
+
+			if !dryRun {
+				if err := fsutil.WriteFileAtomic(objectPath, ciphertext, 0600); err != nil {
+					return nil, err
+				}
+				manifest.Objects[env.ID] = &ManifestObject{
+					OpaqueID:      opaqueID,
+					Fingerprint:   env.RevisionHash,
+					EncryptedSize: int64(len(ciphertext)),
+					UpdatedAt:     time.Now(),
+				}
+			}
+			changedCount++
+		}
+	}
+
+	// V1 Artifacts Sync (compatibility path)
+	artifacts := v.ListArtifacts()
 	for _, art := range artifacts {
 		if err := security.ValidateArtifactSecurity(art); err != nil {
 			return nil, fmt.Errorf("security check failed during sync for artifact %s: %w", art.ID, err)
@@ -353,13 +394,23 @@ func (s *Store) decryptObjectsIntoVault(v *vault.Vault) (int, error) {
 			return decryptedCount, fmt.Errorf("failed decrypting object %s: %w", obj.OpaqueID, err)
 		}
 
+		// Try parsing as V2 Envelope first
+		v2Env := &model.EnvelopeV2{}
+		if err := json.Unmarshal(plaintext, v2Env); err == nil && v2Env.SchemaVersion == model.SchemaVersionV2 {
+			if err := v.SaveEntity(v2Env); err != nil {
+				return decryptedCount, fmt.Errorf("failed saving decrypted V2 entity %s to vault: %w", v2Env.ID, err)
+			}
+			decryptedCount++
+			continue
+		}
+
 		art := &model.Artifact{}
 		if err := json.Unmarshal(plaintext, art); err != nil {
-			return decryptedCount, fmt.Errorf("failed parsing decrypted artifact: %w", err)
+			return decryptedCount, fmt.Errorf("failed parsing decrypted artifact for %s: %w", artID, err)
 		}
 
 		if err := v.SaveArtifact(art); err != nil {
-			return decryptedCount, fmt.Errorf("failed saving decrypted artifact to vault: %w", err)
+			return decryptedCount, fmt.Errorf("failed saving decrypted artifact to vault for %s: %w", artID, err)
 		}
 		decryptedCount++
 	}

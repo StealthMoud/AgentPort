@@ -12,6 +12,7 @@ import (
 var (
 	ErrBackendUnavailable = errors.New("model backend unavailable")
 	ErrInvalidProposal    = errors.New("invalid proposal structure")
+	ErrInvalidModelOutput = errors.New("invalid model output JSON structure")
 )
 
 type ProposalOperation string
@@ -57,9 +58,10 @@ type Proposal struct {
 }
 
 type AnalysisRequest struct {
-	Scope          model.Scope       `json:"scope"`
-	InputStateRoot string            `json:"input_state_root"`
-	Artifacts      []*model.Artifact `json:"artifacts"`
+	Scope          model.Scope         `json:"scope"`
+	InputStateRoot string              `json:"input_state_root"`
+	Artifacts      []*model.Artifact   `json:"artifacts"`
+	Entities       []*model.EnvelopeV2 `json:"entities"`
 }
 
 type AnalysisResponse struct {

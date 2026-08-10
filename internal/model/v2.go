@@ -91,9 +91,12 @@ func (e *EnvelopeV2) Validate() error {
 	}
 
 	switch e.Kind {
-	case KindMemoryV2:
+	case KindMemoryV2, KindInstructionV2, KindPreferenceV2, KindProjectContextV2:
 		if e.Memory == nil {
-			return fmt.Errorf("%w: kind memory requires Memory payload", ErrInvalidV2Envelope)
+			return fmt.Errorf("%w: kind %s requires Memory payload", ErrInvalidV2Envelope, e.Kind)
+		}
+		if e.Skill != nil || e.Agent != nil || e.MCPTool != nil || e.SourceRecord != nil {
+			return fmt.Errorf("%w: kind %s has incompatible extra typed payloads", ErrInvalidV2Envelope, e.Kind)
 		}
 		if e.Memory.Importance < 1 || e.Memory.Importance > 10 {
 			return fmt.Errorf("%w: memory importance must be between 1 and 10", ErrInvalidV2Envelope)
@@ -101,13 +104,32 @@ func (e *EnvelopeV2) Validate() error {
 		if e.Memory.Confidence < 0.0 || e.Memory.Confidence > 1.0 {
 			return fmt.Errorf("%w: memory confidence must be between 0.0 and 1.0", ErrInvalidV2Envelope)
 		}
+		switch e.Memory.Status {
+		case MemoryStatusActive, MemoryStatusSuperseded, MemoryStatusContested, MemoryStatusArchived, MemoryStatusExpired:
+		default:
+			return fmt.Errorf("%w: invalid memory status %s", ErrInvalidV2Envelope, e.Memory.Status)
+		}
+		switch e.Memory.Derivation {
+		case DerivationDirect, DerivationSummarized, DerivationInferred, DerivationImported:
+		default:
+			return fmt.Errorf("%w: invalid memory derivation %s", ErrInvalidV2Envelope, e.Memory.Derivation)
+		}
+		if e.Memory.ReviewState != "" && e.Memory.ReviewState != "approved" && e.Memory.ReviewState != "pending_review" && e.Memory.ReviewState != "rejected" {
+			return fmt.Errorf("%w: invalid review state %s", ErrInvalidV2Envelope, e.Memory.ReviewState)
+		}
 	case KindSourceRecord:
 		if e.SourceRecord == nil {
 			return fmt.Errorf("%w: kind source_record requires SourceRecord payload", ErrInvalidV2Envelope)
 		}
+		if e.Memory != nil || e.Skill != nil || e.Agent != nil || e.MCPTool != nil {
+			return fmt.Errorf("%w: kind source_record has incompatible extra typed payloads", ErrInvalidV2Envelope)
+		}
 	case KindSkillPackage:
 		if e.Skill == nil {
 			return fmt.Errorf("%w: kind skill requires Skill payload", ErrInvalidV2Envelope)
+		}
+		if e.Memory != nil || e.SourceRecord != nil || e.Agent != nil || e.MCPTool != nil {
+			return fmt.Errorf("%w: kind skill has incompatible extra typed payloads", ErrInvalidV2Envelope)
 		}
 		if e.Skill.TrustState != SkillTrustUntrusted && e.Skill.TrustState != SkillTrustTrusted && e.Skill.TrustState != SkillTrustLocalOrigin {
 			return fmt.Errorf("%w: invalid skill trust state %s", ErrInvalidV2Envelope, e.Skill.TrustState)
@@ -116,10 +138,18 @@ func (e *EnvelopeV2) Validate() error {
 		if e.Agent == nil {
 			return fmt.Errorf("%w: kind agent requires Agent payload", ErrInvalidV2Envelope)
 		}
+		if e.Memory != nil || e.SourceRecord != nil || e.Skill != nil || e.MCPTool != nil {
+			return fmt.Errorf("%w: kind agent has incompatible extra typed payloads", ErrInvalidV2Envelope)
+		}
 	case KindMCPToolDef:
 		if e.MCPTool == nil {
 			return fmt.Errorf("%w: kind tool_definition requires MCPTool payload", ErrInvalidV2Envelope)
 		}
+		if e.Memory != nil || e.SourceRecord != nil || e.Skill != nil || e.Agent != nil {
+			return fmt.Errorf("%w: kind tool_definition has incompatible extra typed payloads", ErrInvalidV2Envelope)
+		}
+	default:
+		return fmt.Errorf("%w: unrecognized kind %s", ErrInvalidV2Envelope, e.Kind)
 	}
 
 	return nil

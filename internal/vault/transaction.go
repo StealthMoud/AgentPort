@@ -15,20 +15,22 @@ import (
 
 // Tx represents an in-memory staged transaction for atomic vault mutations.
 type Tx struct {
-	mu         sync.Mutex
-	v          *Vault
-	staged     map[string]*model.Artifact
-	deletions  map[string]bool
-	committed  bool
-	rolledBack bool
+	mu             sync.Mutex
+	v              *Vault
+	staged         map[string]*model.Artifact
+	stagedEntities map[string]*model.EnvelopeV2
+	deletions      map[string]bool
+	committed      bool
+	rolledBack     bool
 }
 
 // BeginTx starts a new transaction against the vault.
 func (v *Vault) BeginTx() *Tx {
 	return &Tx{
-		v:         v,
-		staged:    make(map[string]*model.Artifact),
-		deletions: make(map[string]bool),
+		v:              v,
+		staged:         make(map[string]*model.Artifact),
+		stagedEntities: make(map[string]*model.EnvelopeV2),
+		deletions:      make(map[string]bool),
 	}
 }
 
@@ -69,6 +71,40 @@ func (tx *Tx) SaveArtifact(art *model.Artifact) error {
 	return nil
 }
 
+// SaveEntity stages a Schema V2 Envelope write in the transaction.
+func (tx *Tx) SaveEntity(env *model.EnvelopeV2) error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+
+	if tx.committed || tx.rolledBack {
+		return fmt.Errorf("transaction already finished")
+	}
+
+	if env.SchemaVersion == "" {
+		env.SchemaVersion = model.SchemaVersionV2
+	}
+	if env.Revision < 1 {
+		env.Revision = 1
+	}
+
+	if err := env.Validate(); err != nil {
+		return err
+	}
+
+	if err := security.ValidateEnvelopeSecurity(env); err != nil {
+		return err
+	}
+
+	if env.CreatedAt.IsZero() {
+		env.CreatedAt = time.Now()
+	}
+	env.UpdatedAt = time.Now()
+
+	tx.stagedEntities[env.ID] = env
+	delete(tx.deletions, env.ID)
+	return nil
+}
+
 // DeleteArtifact stages an artifact deletion in the transaction.
 func (tx *Tx) DeleteArtifact(id string) error {
 	tx.mu.Lock()
@@ -79,6 +115,7 @@ func (tx *Tx) DeleteArtifact(id string) error {
 	}
 
 	delete(tx.staged, id)
+	delete(tx.stagedEntities, id)
 	tx.deletions[id] = true
 	return nil
 }
@@ -109,6 +146,14 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 			return fmt.Errorf("transaction commit security check failed for %s: %w", id, err)
 		}
 	}
+	for id, env := range tx.stagedEntities {
+		if err := env.Validate(); err != nil {
+			return fmt.Errorf("transaction commit entity validation failed for %s: %w", id, err)
+		}
+		if err := security.ValidateEnvelopeSecurity(env); err != nil {
+			return fmt.Errorf("transaction commit entity security check failed for %s: %w", id, err)
+		}
+	}
 
 	tx.v.mu.Lock()
 	defer tx.v.mu.Unlock()
@@ -131,7 +176,7 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 	realArtifactsDir := filepath.Join(tx.v.cfg.VaultDir, "artifacts")
 	_ = os.MkdirAll(realArtifactsDir, 0700)
 
-	// Copy existing real artifacts to staging directory
+	// Copy existing real artifacts/entities to staging directory
 	existingEntries, _ := os.ReadDir(realArtifactsDir)
 	for _, entry := range existingEntries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -148,8 +193,13 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		}
 	}
 
-	// Apply staged additions/updates to staging directory
-	count := 0
+	if hook != nil {
+		if err := hook("during_staging"); err != nil {
+			return fmt.Errorf("injected fault during_staging: %w", err)
+		}
+	}
+
+	// Apply staged V1 additions/updates to staging directory
 	for id, art := range tx.staged {
 		if hook != nil {
 			if err := hook("during_write"); err != nil {
@@ -164,7 +214,23 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		if err := fsutil.WriteFileAtomic(artPath, data, 0600); err != nil {
 			return fmt.Errorf("failed atomic write for staged artifact %s: %w", id, err)
 		}
-		count++
+	}
+
+	// Apply staged V2 additions/updates to staging directory
+	for id, env := range tx.stagedEntities {
+		if hook != nil {
+			if err := hook("during_write"); err != nil {
+				return fmt.Errorf("injected fault during_write: %w", err)
+			}
+		}
+		envPath := filepath.Join(stagedArtifactsDir, id+".json")
+		data, err := json.MarshalIndent(env, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed marshaling entity %s: %w", id, err)
+		}
+		if err := fsutil.WriteFileAtomic(envPath, data, 0600); err != nil {
+			return fmt.Errorf("failed atomic write for staged entity %s: %w", id, err)
+		}
 	}
 
 	if hook != nil {
@@ -188,41 +254,56 @@ func (tx *Tx) CommitWithFaultHook(hook FaultHook) error {
 		if err := hook("pre_commit"); err != nil {
 			return fmt.Errorf("injected fault pre_commit: %w", err)
 		}
-	}
-
-	// Commit Pass: Copy verified staging files into real directory via atomic write
-	stagedEntries, err := os.ReadDir(stagedArtifactsDir)
-	if err != nil {
-		return fmt.Errorf("failed reading staging directory: %w", err)
-	}
-
-	for _, entry := range stagedEntries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		stagedFile := filepath.Join(stagedArtifactsDir, entry.Name())
-		realFile := filepath.Join(realArtifactsDir, entry.Name())
-		data, err := os.ReadFile(stagedFile)
-		if err != nil {
-			return fmt.Errorf("failed reading staged file: %w", err)
-		}
-		if err := fsutil.WriteFileAtomic(realFile, data, 0600); err != nil {
-			return fmt.Errorf("failed writing real file: %w", err)
+		if err := hook("pre_swap"); err != nil {
+			return fmt.Errorf("injected fault pre_swap: %w", err)
 		}
 	}
 
-	// Remove deleted files from real directory
-	for id := range tx.deletions {
-		realFile := filepath.Join(realArtifactsDir, id+".json")
-		_ = os.Remove(realFile)
+	// Whole-directory atomic swap: rename realArtifactsDir -> backupDir, move stagedArtifactsDir -> realArtifactsDir
+	backupDir := filepath.Join(tx.v.cfg.VaultDir, fmt.Sprintf("artifacts_backup_%d", time.Now().UnixNano()))
+
+	if err := os.Rename(realArtifactsDir, backupDir); err != nil {
+		_, _ = fsutil.BackupFile(realArtifactsDir, backupDir)
 	}
 
-	// Update in-memory state ONLY AFTER disk write succeeds completely
+	if hook != nil {
+		if err := hook("after_backup_rename"); err != nil {
+			_ = os.Rename(backupDir, realArtifactsDir)
+			return fmt.Errorf("injected fault after_backup_rename: %w", err)
+		}
+	}
+
+	if err := os.Rename(stagedArtifactsDir, realArtifactsDir); err != nil {
+		_ = os.Rename(backupDir, realArtifactsDir)
+		return fmt.Errorf("failed atomic directory swap: %w", err)
+	}
+
+	if hook != nil {
+		if err := hook("during_final_swap"); err != nil {
+			_ = os.Rename(realArtifactsDir, stagedArtifactsDir)
+			_ = os.Rename(backupDir, realArtifactsDir)
+			return fmt.Errorf("injected fault during_final_swap: %w", err)
+		}
+	}
+
+	_ = os.RemoveAll(backupDir)
+
+	if hook != nil {
+		if err := hook("post_swap_pre_inmemory"); err != nil {
+			return fmt.Errorf("injected fault post_swap_pre_inmemory: %w", err)
+		}
+	}
+
+	// Update in-memory state ONLY AFTER atomic directory swap succeeds completely
 	for id, art := range tx.staged {
 		tx.v.artifacts[id] = art.Clone()
 	}
+	for id, env := range tx.stagedEntities {
+		tx.v.entities[id] = env
+	}
 	for id := range tx.deletions {
 		delete(tx.v.artifacts, id)
+		delete(tx.v.entities, id)
 	}
 
 	tx.committed = true
@@ -239,6 +320,7 @@ func (tx *Tx) Rollback() error {
 	}
 
 	tx.staged = make(map[string]*model.Artifact)
+	tx.stagedEntities = make(map[string]*model.EnvelopeV2)
 	tx.deletions = make(map[string]bool)
 	tx.rolledBack = true
 	return nil

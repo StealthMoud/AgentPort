@@ -159,12 +159,58 @@ func isExplicitCodexSurface(path string) (bool, string, string) {
 }
 
 func (c *CodexAdapter) Import(ctx context.Context, machineID string) ([]*model.Artifact, error) {
+	v2Envs, err := c.ImportV2(ctx, machineID, nil)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := make([]*model.Artifact, 0, len(v2Envs))
+	for _, env := range v2Envs {
+		title := "instructions"
+		if env.Skill != nil && env.Skill.Name != "" {
+			title = env.Skill.Name
+		} else if env.Agent != nil && env.Agent.Name != "" {
+			title = env.Agent.Name
+		} else if env.MCPTool != nil && env.MCPTool.Name != "" {
+			title = env.MCPTool.Name
+		}
+		art := &model.Artifact{
+			SchemaVersion: model.SchemaVersionV1,
+			Kind:          model.KindInstruction,
+			Scope:         env.Scope,
+			Title:         title,
+			Content:       "",
+			ContentType:   "text/markdown",
+			Lifecycle:     model.LifecyclePersistent,
+			Sensitivity:   model.SensitivityNormal,
+			CreatedAt:     env.CreatedAt,
+			UpdatedAt:     env.UpdatedAt,
+		}
+		if env.Memory != nil {
+			art.Content = env.Memory.Statement
+		} else if env.Skill != nil {
+			art.Kind = model.KindSkill
+			art.Content = env.Skill.SkillMD
+		} else if env.Agent != nil {
+			art.Kind = model.KindAgent
+			art.Content = env.Agent.Instructions
+		} else if env.MCPTool != nil {
+			art.Kind = model.KindToolDefinition
+			art.Content = env.MCPTool.Command
+		}
+		art.UpdateFingerprint()
+		art.ID = model.GenerateArtifactID(art.Kind, art.Fingerprint)
+		artifacts = append(artifacts, art)
+	}
+	return artifacts, nil
+}
+
+func (c *CodexAdapter) ImportV2(ctx context.Context, machineID string, opCtx *adapter.OperationContext) ([]*model.EnvelopeV2, error) {
 	scanRes, err := c.Scan(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	artifacts := make([]*model.Artifact, 0)
+	envelopes := make([]*model.EnvelopeV2, 0)
 
 	for _, detail := range scanRes.Details {
 		if detail.Status != "supported" {
@@ -183,40 +229,72 @@ func (c *CodexAdapter) Import(ctx context.Context, machineID string) ([]*model.A
 		}
 
 		title := strings.TrimSuffix(filepath.Base(detail.Path), filepath.Ext(detail.Path))
-		kind := model.KindInstruction
-		if strings.Contains(strings.ToLower(title), "memory") {
-			kind = model.KindMemory
+		scope := model.ScopeGlobal
+		projID := ""
+		if opCtx != nil && opCtx.WorkspacePath != "" && strings.HasPrefix(detail.Path, opCtx.WorkspacePath) {
+			scope = model.ScopeProject
+			projID = opCtx.ProjectID
 		}
 
-		art := &model.Artifact{
-			SchemaVersion: model.SchemaVersionV1,
-			Kind:          kind,
-			Scope:         model.ScopeGlobal,
-			Title:         title,
-			Content:       content,
-			ContentType:   "text/markdown",
-			Lifecycle:     model.LifecyclePersistent,
-			Sensitivity:   model.SensitivityNormal,
+		env := &model.EnvelopeV2{
+			SchemaVersion: model.SchemaVersionV2,
+			Scope:         scope,
+			ProjectID:     projID,
+			Revision:      1,
+			RevisionHash:  model.ComputeFingerprint(model.KindInstruction, scope, title, content, nil),
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
-			Provenance: []model.Provenance{
-				{
-					Provider:          c.Name(),
-					MachineID:         machineID,
-					SourcePath:        detail.Path,
-					ImportedAt:        time.Now(),
-					SourceFingerprint: model.ComputeFingerprint(kind, model.ScopeGlobal, title, content, nil),
-				},
-			},
+			Lifecycle:     model.LifecyclePersistent,
+			Sensitivity:   model.SensitivityNormal,
 		}
 
-		art.UpdateFingerprint()
-		art.ID = model.GenerateArtifactID(art.Kind, art.Fingerprint)
+		switch detail.Kind {
+		case string(model.KindSkillPackage):
+			env.ID = model.GenerateEntityID("aps")
+			env.Kind = model.KindSkillPackage
+			env.Skill = &model.SkillPackage{
+				Name:        title,
+				Description: "Codex imported skill package",
+				SkillMD:     content,
+				TrustState:  model.SkillTrustUntrusted,
+			}
+		case string(model.KindAgentDef):
+			env.ID = model.GenerateEntityID("apa")
+			env.Kind = model.KindAgentDef
+			env.Agent = &model.AgentDef{
+				Name:         title,
+				Description:  "Codex imported agent definition",
+				Instructions: content,
+			}
+		case string(model.KindMCPToolDef):
+			env.ID = model.GenerateEntityID("apmcp")
+			env.Kind = model.KindMCPToolDef
+			env.MCPTool = &model.MCPToolDef{
+				Name:      title,
+				Command:   "npx",
+				Transport: "stdio",
+			}
+		default:
+			env.ID = model.GenerateEntityID("api")
+			env.Kind = model.KindInstructionV2
+			env.Memory = &model.MemoryPayload{
+				Statement:       content,
+				Category:        model.CategoryWorkflow,
+				Status:          model.MemoryStatusActive,
+				Importance:      8,
+				Confidence:      1.0,
+				Derivation:      model.DerivationImported,
+				LastConfirmedAt: time.Now(),
+				ReviewState:     "approved",
+			}
+		}
 
-		artifacts = append(artifacts, art)
+		if err := env.Validate(); err == nil {
+			envelopes = append(envelopes, env)
+		}
 	}
 
-	return artifacts, nil
+	return envelopes, nil
 }
 
 func (c *CodexAdapter) PlanExport(ctx context.Context, artifacts []*model.Artifact) (*adapter.ExportPlan, error) {

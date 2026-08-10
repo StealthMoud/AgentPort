@@ -25,6 +25,7 @@ type AuditEvent struct {
 	ProposalID      string    `json:"proposal_id,omitempty"`
 	StateRootBefore string    `json:"state_root_before,omitempty"`
 	StateRootAfter  string    `json:"state_root_after,omitempty"`
+	SnapshotID      string    `json:"snapshot_id,omitempty"`
 }
 
 type Journal struct {

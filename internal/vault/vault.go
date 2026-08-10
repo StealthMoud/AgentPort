@@ -45,6 +45,7 @@ type Vault struct {
 	Machine   *MachineMetadata
 	Key       *crypt.KeyPair
 	artifacts map[string]*model.Artifact
+	entities  map[string]*model.EnvelopeV2
 }
 
 // GenerateID generates a random hex identifier with a prefix (e.g. apv_... or apm_...).
@@ -143,6 +144,7 @@ func Initialize(cfg *config.Config) (*Vault, error) {
 		Machine:   machineMeta,
 		Key:       kp,
 		artifacts: make(map[string]*model.Artifact),
+		entities:  make(map[string]*model.EnvelopeV2),
 	}
 
 	if err := v.LoadAll(); err != nil {
@@ -161,7 +163,7 @@ func LoadOpen(cfg *config.Config) (*Vault, error) {
 	return Initialize(cfg)
 }
 
-// LoadAll loads all local decrypted artifacts from disk.
+// LoadAll loads all local decrypted artifacts and V2 entities from disk.
 func (v *Vault) LoadAll() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -177,6 +179,7 @@ func (v *Vault) LoadAll() error {
 	}
 
 	v.artifacts = make(map[string]*model.Artifact)
+	v.entities = make(map[string]*model.EnvelopeV2)
 
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -189,6 +192,13 @@ func (v *Vault) LoadAll() error {
 			return fmt.Errorf("failed reading artifact %s: %w", entry.Name(), err)
 		}
 
+		// Try parsing as V2 Envelope first
+		v2Env := &model.EnvelopeV2{}
+		if err := json.Unmarshal(data, v2Env); err == nil && v2Env.SchemaVersion == model.SchemaVersionV2 {
+			v.entities[v2Env.ID] = v2Env
+			continue
+		}
+
 		art := &model.Artifact{}
 		if err := json.Unmarshal(data, art); err != nil {
 			return fmt.Errorf("failed parsing artifact %s: %w", entry.Name(), err)
@@ -197,6 +207,139 @@ func (v *Vault) LoadAll() error {
 		v.artifacts[art.ID] = art
 	}
 
+	return nil
+}
+
+// SaveEntity validates and persists a V2 envelope to local storage.
+func (v *Vault) SaveEntity(env *model.EnvelopeV2) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if env.SchemaVersion == "" {
+		env.SchemaVersion = model.SchemaVersionV2
+	}
+	if env.Revision < 1 {
+		env.Revision = 1
+	}
+
+	if err := env.Validate(); err != nil {
+		return err
+	}
+
+	if err := security.ValidateEnvelopeSecurity(env); err != nil {
+		return err
+	}
+
+	if env.CreatedAt.IsZero() {
+		env.CreatedAt = time.Now()
+	}
+	env.UpdatedAt = time.Now()
+
+	artifactsDir := filepath.Join(v.cfg.VaultDir, "artifacts")
+	if err := os.MkdirAll(artifactsDir, 0700); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	artPath := filepath.Join(artifactsDir, env.ID+".json")
+	if err := fsutil.WriteFileAtomic(artPath, data, 0600); err != nil {
+		return err
+	}
+
+	v.entities[env.ID] = env
+	return nil
+}
+
+// GetEntity retrieves a V2 envelope by ID.
+func (v *Vault) GetEntity(id string) (*model.EnvelopeV2, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	env, exists := v.entities[id]
+	if !exists {
+		return nil, false
+	}
+	return env, true
+}
+
+// ListEntities returns a slice of all current V2 envelopes.
+func (v *Vault) ListEntities() []*model.EnvelopeV2 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	res := make([]*model.EnvelopeV2, 0, len(v.entities))
+	for _, env := range v.entities {
+		res = append(res, env)
+	}
+	return res
+}
+
+// DeleteEntity deletes a V2 envelope by ID and creates a tombstone.
+func (v *Vault) DeleteEntity(id string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	var prevHash string
+	if env, ok := v.entities[id]; ok {
+		prevHash = env.RevisionHash
+	}
+
+	artPath := filepath.Join(v.cfg.VaultDir, "artifacts", id+".json")
+	_ = os.Remove(artPath)
+	delete(v.entities, id)
+
+	tombDir := filepath.Join(v.cfg.VaultDir, "tombstones")
+	_ = os.MkdirAll(tombDir, 0700)
+	ts := &model.Tombstone{
+		EntityID:             id,
+		DeletedRevision:      1,
+		DeletedAt:            time.Now(),
+		OriginMachineID:      v.Machine.MachineID,
+		PreviousRevisionHash: prevHash,
+	}
+	data, _ := json.MarshalIndent(ts, "", "  ")
+	_ = fsutil.WriteFileAtomic(filepath.Join(tombDir, id+".json"), data, 0600)
+
+	return nil
+}
+
+// UpdateEntity updates an existing V2 envelope, preserving entity ID and incrementing Revision (N -> N+1).
+func (v *Vault) UpdateEntity(env *model.EnvelopeV2) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	existing, exists := v.entities[env.ID]
+	if !exists {
+		return fmt.Errorf("entity %s not found for update", env.ID)
+	}
+
+	env.Revision = existing.Revision + 1
+	env.UpdatedAt = time.Now()
+
+	if err := env.Validate(); err != nil {
+		return err
+	}
+
+	if err := security.ValidateEnvelopeSecurity(env); err != nil {
+		return err
+	}
+
+	artifactsDir := filepath.Join(v.cfg.VaultDir, "artifacts")
+	data, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	artPath := filepath.Join(artifactsDir, env.ID+".json")
+	if err := fsutil.WriteFileAtomic(artPath, data, 0600); err != nil {
+		return err
+	}
+
+	v.entities[env.ID] = env
 	return nil
 }
 

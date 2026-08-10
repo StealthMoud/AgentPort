@@ -162,12 +162,42 @@ func isExplicitClaudeSurface(path string) (bool, string, string) {
 }
 
 func (c *ClaudeAdapter) Import(ctx context.Context, machineID string) ([]*model.Artifact, error) {
+	v2Envs, err := c.ImportV2(ctx, machineID, nil)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := make([]*model.Artifact, 0, len(v2Envs))
+	for _, env := range v2Envs {
+		title := "instructions"
+		art := &model.Artifact{
+			SchemaVersion: model.SchemaVersionV1,
+			Kind:          model.KindInstruction,
+			Scope:         env.Scope,
+			Title:         title,
+			Content:       "",
+			ContentType:   "text/markdown",
+			Lifecycle:     model.LifecyclePersistent,
+			Sensitivity:   model.SensitivityNormal,
+			CreatedAt:     env.CreatedAt,
+			UpdatedAt:     env.UpdatedAt,
+		}
+		if env.Memory != nil {
+			art.Content = env.Memory.Statement
+		}
+		art.UpdateFingerprint()
+		art.ID = model.GenerateArtifactID(art.Kind, art.Fingerprint)
+		artifacts = append(artifacts, art)
+	}
+	return artifacts, nil
+}
+
+func (c *ClaudeAdapter) ImportV2(ctx context.Context, machineID string, opCtx *adapter.OperationContext) ([]*model.EnvelopeV2, error) {
 	scanRes, err := c.Scan(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	artifacts := make([]*model.Artifact, 0)
+	envelopes := make([]*model.EnvelopeV2, 0)
 
 	for _, detail := range scanRes.Details {
 		if detail.Status != "supported" {
@@ -186,40 +216,43 @@ func (c *ClaudeAdapter) Import(ctx context.Context, machineID string) ([]*model.
 		}
 
 		title := strings.TrimSuffix(filepath.Base(detail.Path), filepath.Ext(detail.Path))
-		kind := model.KindInstruction
-		if strings.Contains(strings.ToLower(title), "memory") {
-			kind = model.KindMemory
+		scope := model.ScopeGlobal
+		projID := ""
+		if opCtx != nil && opCtx.WorkspacePath != "" && strings.HasPrefix(detail.Path, opCtx.WorkspacePath) {
+			scope = model.ScopeProject
+			projID = opCtx.ProjectID
 		}
 
-		art := &model.Artifact{
-			SchemaVersion: model.SchemaVersionV1,
-			Kind:          kind,
-			Scope:         model.ScopeGlobal,
-			Title:         title,
-			Content:       content,
-			ContentType:   "text/markdown",
-			Lifecycle:     model.LifecyclePersistent,
-			Sensitivity:   model.SensitivityNormal,
+		env := &model.EnvelopeV2{
+			ID:            model.GenerateEntityID("api"),
+			SchemaVersion: model.SchemaVersionV2,
+			Kind:          model.KindInstructionV2,
+			Scope:         scope,
+			ProjectID:     projID,
+			Revision:      1,
+			RevisionHash:  model.ComputeFingerprint(model.KindInstruction, scope, title, content, nil),
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
-			Provenance: []model.Provenance{
-				{
-					Provider:          c.Name(),
-					MachineID:         machineID,
-					SourcePath:        detail.Path,
-					ImportedAt:        time.Now(),
-					SourceFingerprint: model.ComputeFingerprint(kind, model.ScopeGlobal, title, content, nil),
-				},
+			Lifecycle:     model.LifecyclePersistent,
+			Sensitivity:   model.SensitivityNormal,
+			Memory: &model.MemoryPayload{
+				Statement:       content,
+				Category:        model.CategoryWorkflow,
+				Status:          model.MemoryStatusActive,
+				Importance:      8,
+				Confidence:      1.0,
+				Derivation:      model.DerivationImported,
+				LastConfirmedAt: time.Now(),
+				ReviewState:     "approved",
 			},
 		}
 
-		art.UpdateFingerprint()
-		art.ID = model.GenerateArtifactID(art.Kind, art.Fingerprint)
-
-		artifacts = append(artifacts, art)
+		if err := env.Validate(); err == nil {
+			envelopes = append(envelopes, env)
+		}
 	}
 
-	return artifacts, nil
+	return envelopes, nil
 }
 
 func (c *ClaudeAdapter) PlanExport(ctx context.Context, artifacts []*model.Artifact) (*adapter.ExportPlan, error) {

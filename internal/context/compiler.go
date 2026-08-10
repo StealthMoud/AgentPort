@@ -42,6 +42,7 @@ type CompileManifest struct {
 	TargetProvider  string         `json:"target_provider"`
 	StateRoot       string         `json:"state_root"`
 	WorkspacePath   string         `json:"workspace_path,omitempty"`
+	Estimator       string         `json:"estimator"`
 	Budget          *TokenBudget   `json:"budget"`
 	TotalTokensEst  int            `json:"total_tokens_est"`
 	Items           []*CompileItem `json:"items"`
@@ -107,6 +108,7 @@ func (cc *ContextCompiler) Compile(ctx context.Context, v *vault.Vault, provider
 	manifest := &CompileManifest{
 		TargetProvider:  providerName,
 		StateRoot:       stateRoot,
+		Estimator:       "generic_char4",
 		Budget:          cc.budget,
 		Items:           make([]*CompileItem, 0, len(artifacts)),
 		CompiledContent: "",
