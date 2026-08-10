@@ -32,11 +32,13 @@ func ReconcileV2(v *vault.Vault, imported []*model.EnvelopeV2) (*ReconcileResult
 	for _, existing := range existingEntities {
 		byID[existing.ID] = existing
 		if existing.SourceRecord != nil && existing.SourceRecord.LogicalSourceKey != "" {
-			key := fmt.Sprintf("%s|%s|%s|%s", existing.SourceRecord.Provider, existing.SourceRecord.MachineID, existing.ProjectID, existing.SourceRecord.LogicalSourceKey)
+			// MachineID is intentionally excluded: logical identity must be portable across machines.
+			key := fmt.Sprintf("%s|%s|%s", existing.SourceRecord.Provider, existing.ProjectID, existing.SourceRecord.LogicalSourceKey)
 			byLogicalKey[key] = existing
 		} else if len(existing.Provenance) > 0 {
 			p := existing.Provenance[0]
-			key := fmt.Sprintf("%s|%s|%s|%s|%s", p.Provider, p.MachineID, existing.ProjectID, string(existing.Kind), p.SourcePath)
+			// MachineID excluded from portable key.
+			key := fmt.Sprintf("%s|%s|%s|%s", p.Provider, existing.ProjectID, string(existing.Kind), p.SourcePath)
 			byLogicalKey[key] = existing
 		}
 	}
@@ -56,18 +58,18 @@ func ReconcileV2(v *vault.Vault, imported []*model.EnvelopeV2) (*ReconcileResult
 			}
 		}
 
-		// 2. Logical source key match
+		// 2. Logical source key match (MachineID excluded for portability)
 		if match == nil && cloned.SourceRecord != nil && cloned.SourceRecord.LogicalSourceKey != "" {
-			key := fmt.Sprintf("%s|%s|%s|%s", cloned.SourceRecord.Provider, cloned.SourceRecord.MachineID, cloned.ProjectID, cloned.SourceRecord.LogicalSourceKey)
+			key := fmt.Sprintf("%s|%s|%s", cloned.SourceRecord.Provider, cloned.ProjectID, cloned.SourceRecord.LogicalSourceKey)
 			if existing, ok := byLogicalKey[key]; ok {
 				match = existing
 			}
 		}
 
-		// 3. Provenance match
+		// 3. Provenance match (MachineID excluded for portability)
 		if match == nil && len(cloned.Provenance) > 0 {
 			p := cloned.Provenance[0]
-			key := fmt.Sprintf("%s|%s|%s|%s|%s", p.Provider, p.MachineID, cloned.ProjectID, string(cloned.Kind), p.SourcePath)
+			key := fmt.Sprintf("%s|%s|%s|%s", p.Provider, cloned.ProjectID, string(cloned.Kind), p.SourcePath)
 			if existing, ok := byLogicalKey[key]; ok {
 				match = existing
 			}

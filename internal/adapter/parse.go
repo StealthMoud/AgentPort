@@ -111,6 +111,13 @@ func ParseMCPConfig(content string) ([]*model.MCPToolDef, error) {
 		tools = append(tools, tool)
 	}
 
+	// Sort tools by Name so that output order is deterministic regardless of
+	// Go's non-deterministic map iteration, which would otherwise produce
+	// different ImportV2 entity orderings across runs.
+	sort.Slice(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
+
 	return tools, nil
 }
 

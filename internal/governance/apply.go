@@ -197,14 +197,19 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 		return fmt.Errorf("failed committing proposal set application: %w", err)
 	}
 
-	// 5. Audit record
+	// 5. Audit record. If any audit/proposal persistence fails AFTER the canonical
+	//    state has been committed, we restore the pre-apply snapshot so that the
+	//    canonical state and the audit log stay consistent (fail-closed invariant).
 	j := NewJournal(cfg)
 	ps := NewProposalStore(cfg)
 
 	for _, prop := range props {
 		prop.Status = compiler.ProposalStatusAccepted
 		if err := ps.SaveProposal(prop); err != nil {
-			return fmt.Errorf("failed saving proposal status for %s: %w", prop.ID, err)
+			// Restore canonical state from the pre-apply snapshot (fail-closed).
+			snapMgr := snapshot.NewManager(cfg)
+			_ = snapMgr.RestoreSnapshot(v, snapID)
+			return fmt.Errorf("failed saving proposal status for %s (canonical state rolled back to snap %s): %w", prop.ID, snapID, err)
 		}
 		if err := j.RecordEvent(&AuditEvent{
 			Actor:      "memory_compiler",
@@ -213,7 +218,10 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 			TargetID:   prop.ID,
 			SnapshotID: snapID,
 		}); err != nil {
-			return fmt.Errorf("failed recording audit event for %s: %w", prop.ID, err)
+			// Restore canonical state from the pre-apply snapshot (fail-closed).
+			snapMgr := snapshot.NewManager(cfg)
+			_ = snapMgr.RestoreSnapshot(v, snapID)
+			return fmt.Errorf("failed recording audit event for %s (canonical state rolled back to snap %s): %w", prop.ID, snapID, err)
 		}
 	}
 

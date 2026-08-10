@@ -240,7 +240,14 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 
 		existingObj, exists := manifest.Objects[env.ID]
 		if !exists || existingObj.Fingerprint != env.RevisionHash {
-			envBytes, err := json.MarshalIndent(env, "", "  ")
+			// Clone and strip machine-local fields before portable encryption.
+			// LocalPathRef is a local filesystem reference that must not enter the sync store.
+			portable := env.Clone()
+			if portable.SourceRecord != nil {
+				portable.SourceRecord.LocalPathRef = ""
+			}
+
+			envBytes, err := json.MarshalIndent(portable, "", "  ")
 			if err != nil {
 				return nil, err
 			}
@@ -345,20 +352,22 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 		return nil, fmt.Errorf("failed saving manifest: %w", err)
 	}
 
-	// 7. Git commit and push if remote is configured
-	hasChanges, err := s.hasStagedOrUnstagedChanges(ctx)
+	// 7. Stage all pending changes (always, to ensure git normalisation runs before diff check).
+	// On Windows this handles CRLF normalisation so that git diff --cached is accurate.
+	if _, err := s.execGit(ctx, "add", "-A"); err != nil {
+		return nil, fmt.Errorf("failed git add: %w", err)
+	}
+
+	// Check whether staging produced any real differences.
+	hasStaged, err := s.hasAnyStagedChanges(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	if !hasChanges {
+	if !hasStaged {
 		res.Status = SyncStatusSuccess
 		res.Message = "Vault already fully in sync"
 		return res, nil
-	}
-
-	if _, err := s.execGit(ctx, "add", "-A"); err != nil {
-		return nil, fmt.Errorf("failed git add: %w", err)
 	}
 
 	commitMsg := fmt.Sprintf("sync: vault state updated (%s)", time.Now().Format(time.RFC3339))
@@ -460,10 +469,32 @@ func (s *Store) decryptObjectsIntoVault(v *vault.Vault) (int, error) {
 	return decryptedCount, nil
 }
 
-func (s *Store) hasStagedOrUnstagedChanges(ctx context.Context) (bool, error) {
-	out, err := s.execGit(ctx, "status", "--porcelain")
-	if err != nil {
-		return false, err
+// hasAnyStagedChanges returns true when there are staged changes ready to commit.
+// It uses the exit-code of `git diff --cached --quiet` (0 = clean, 1 = has diffs)
+// rather than parsing English `git status` output, which is fragile on Windows due
+// to CRLF normalisation producing spurious "modified" entries.
+func (s *Store) hasAnyStagedChanges(ctx context.Context) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet")
+	cmd.Dir = s.cfg.SyncRepoDir
+	err := cmd.Run()
+	if err == nil {
+		// Exit 0 → index identical to HEAD (or HEAD does not exist yet on empty repo)
+		// Check separately whether there is an initial unborn commit situation.
+		revOut, revErr := s.execGit(ctx, "rev-parse", "--verify", "HEAD")
+		if revErr != nil || revOut == "" {
+			// Unborn repo: use status --porcelain to detect any staged files.
+			out, serr := s.execGit(ctx, "status", "--porcelain")
+			if serr != nil {
+				return false, serr
+			}
+			return len(strings.TrimSpace(out)) > 0, nil
+		}
+		return false, nil
 	}
-	return len(strings.TrimSpace(out)) > 0, nil
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		// Exit 1 → has staged changes
+		return true, nil
+	}
+	return false, fmt.Errorf("git diff --cached --quiet failed unexpectedly: %w", err)
 }

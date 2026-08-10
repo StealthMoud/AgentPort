@@ -606,3 +606,128 @@ func TestFailedDeleteTransactionDoesNotLeaveTombstone(t *testing.T) {
 		t.Errorf("failed delete transaction leaked orphaned tombstone to disk!")
 	}
 }
+
+// TestTombstoneSwapRollbackOnFault verifies that if the tombstone directory swap fails
+// after artifacts have already been swapped, both directories are rolled back atomically.
+func TestTombstoneSwapRollbackOnFault(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	env := &model.EnvelopeV2{
+		ID:            "apm_tombswap_rollback_test",
+		SchemaVersion: model.SchemaVersionV2,
+		Kind:          model.KindMemoryV2,
+		Scope:         model.ScopeGlobal,
+		Revision:      1,
+		Memory: &model.MemoryPayload{
+			Statement:  "Tombstone swap rollback test",
+			Category:   model.CategoryWorkflow,
+			Status:     model.MemoryStatusActive,
+			Importance: 7,
+			Confidence: 0.9,
+			Derivation: model.DerivationDirect,
+		},
+	}
+	env.RevisionHash = model.ComputeRevisionHash(env)
+	_ = v.SaveEntity(env)
+
+	// Record original state root
+	root1 := model.ComputeV2StateRoot(v.ListEntities())
+
+	// Attempt a delete that will fail at the tombstones rename stage
+	tx := v.BeginTx()
+	_ = tx.DeleteEntity(env.ID)
+
+	err := tx.CommitWithFaultHook(func(phase string) error {
+		if phase == "during_final_swap" {
+			return fmt.Errorf("injected fault during_final_swap")
+		}
+		return nil
+	})
+
+	if err == nil {
+		t.Fatalf("expected commit to fail at during_final_swap hook")
+	}
+
+	// Both artifact and tombstone dirs must have been rolled back: entity must still exist.
+	reopened, err := vault.LoadOpen(cfg)
+	if err != nil {
+		t.Fatalf("vault.LoadOpen failed: %v", err)
+	}
+
+	if _, exists := reopened.GetEntity(env.ID); !exists {
+		t.Errorf("entity must survive tombstone swap rollback — disk inconsistency detected")
+	}
+	if _, tombExists := reopened.GetTombstone(env.ID); tombExists {
+		t.Errorf("tombstone must not exist after rollback of failed swap")
+	}
+
+	// State root must be identical to before the failed operation
+	root2 := model.ComputeV2StateRoot(reopened.ListEntities())
+	if root1 != root2 {
+		t.Errorf("state root changed after failed tombstone swap rollback: before=%s after=%s", root1, root2)
+	}
+}
+
+// TestTombstoneSwapRollbackDoesNotCorruptOngoingEntities verifies that a failed deletion
+// transaction does not corrupt unrelated entities that were already in the vault.
+func TestTombstoneSwapRollbackDoesNotCorruptOngoingEntities(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv(config.EnvAppHome, filepath.Join(tempDir, "home"))
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	makeEntity := func(id, statement string) *model.EnvelopeV2 {
+		e := &model.EnvelopeV2{
+			ID:            id,
+			SchemaVersion: model.SchemaVersionV2,
+			Kind:          model.KindMemoryV2,
+			Scope:         model.ScopeGlobal,
+			Revision:      1,
+			Memory: &model.MemoryPayload{
+				Statement:  statement,
+				Category:   model.CategoryWorkflow,
+				Status:     model.MemoryStatusActive,
+				Importance: 5,
+				Confidence: 0.8,
+				Derivation: model.DerivationDirect,
+			},
+		}
+		e.RevisionHash = model.ComputeRevisionHash(e)
+		return e
+	}
+
+	e1 := makeEntity("apm_survivor", "Survivor entity")
+	e2 := makeEntity("apm_target_del", "Entity to delete")
+	_ = v.SaveEntity(e1)
+	_ = v.SaveEntity(e2)
+
+	// Fail mid-swap while deleting e2
+	tx := v.BeginTx()
+	_ = tx.DeleteEntity(e2.ID)
+	_ = tx.CommitWithFaultHook(func(phase string) error {
+		if phase == "after_backup_rename" {
+			return fmt.Errorf("injected after_backup_rename fault")
+		}
+		return nil
+	})
+
+	// Both entities must be intact on disk
+	reopened, err := vault.LoadOpen(cfg)
+	if err != nil {
+		t.Fatalf("vault.LoadOpen failed: %v", err)
+	}
+
+	if _, ok := reopened.GetEntity(e1.ID); !ok {
+		t.Errorf("survivor entity must still exist after failed delete tx")
+	}
+	if _, ok := reopened.GetEntity(e2.ID); !ok {
+		t.Errorf("target entity must still exist after failed delete tx (not yet committed)")
+	}
+}

@@ -432,18 +432,53 @@ func ComputeRevisionHash(env *EnvelopeV2) string {
 		}
 	case KindSkillPackage:
 		if env.Skill != nil {
-			payloadStr = fmt.Sprintf("name:%s|desc:%s|md:%s|trust:%s|exec:%v",
-				env.Skill.Name, env.Skill.Description, env.Skill.SkillMD, env.Skill.TrustState, env.Skill.HasExecutables)
+			// Collect and sort script/reference/asset keys for deterministic ordering.
+			var scriptKeys, refKeys, assetKeys []string
+			for k := range env.Skill.Scripts {
+				scriptKeys = append(scriptKeys, k)
+			}
+			for k := range env.Skill.References {
+				refKeys = append(refKeys, k)
+			}
+			for k := range env.Skill.Assets {
+				assetKeys = append(assetKeys, k)
+			}
+			sort.Strings(scriptKeys)
+			sort.Strings(refKeys)
+			sort.Strings(assetKeys)
+			var scriptParts, refParts, assetParts []string
+			for _, k := range scriptKeys {
+				scriptParts = append(scriptParts, k+"="+env.Skill.Scripts[k])
+			}
+			for _, k := range refKeys {
+				refParts = append(refParts, k+"="+env.Skill.References[k])
+			}
+			for _, k := range assetKeys {
+				assetParts = append(assetParts, k+"="+env.Skill.Assets[k])
+			}
+			payloadStr = fmt.Sprintf("name:%s|desc:%s|md:%s|trust:%s|exec:%v|scripts:%s|refs:%s|assets:%s",
+				env.Skill.Name, env.Skill.Description, env.Skill.SkillMD, env.Skill.TrustState, env.Skill.HasExecutables,
+				strings.Join(scriptParts, ";"), strings.Join(refParts, ";"), strings.Join(assetParts, ";"))
 		}
 	case KindAgentDef:
 		if env.Agent != nil {
-			payloadStr = fmt.Sprintf("name:%s|desc:%s|inst:%s|model:%s",
-				env.Agent.Name, env.Agent.Description, env.Agent.Instructions, env.Agent.PreferredModelClass)
+			caps := append([]string(nil), env.Agent.Capabilities...)
+			skills := append([]string(nil), env.Agent.Skills...)
+			sort.Strings(caps)
+			sort.Strings(skills)
+			payloadStr = fmt.Sprintf("name:%s|desc:%s|inst:%s|model:%s|caps:%s|skills:%s",
+				env.Agent.Name, env.Agent.Description, env.Agent.Instructions, env.Agent.PreferredModelClass,
+				strings.Join(caps, ","), strings.Join(skills, ","))
 		}
 	case KindMCPToolDef:
 		if env.MCPTool != nil {
-			payloadStr = fmt.Sprintf("name:%s|cmd:%s|url:%s|trans:%s|reqcred:%v",
-				env.MCPTool.Name, env.MCPTool.Command, env.MCPTool.URL, env.MCPTool.Transport, env.MCPTool.RequiresCredential)
+			args := append([]string(nil), env.MCPTool.Args...)
+			envVars := append([]string(nil), env.MCPTool.EnvVarNames...)
+			sort.Strings(args)
+			sort.Strings(envVars)
+			payloadStr = fmt.Sprintf("name:%s|cmd:%s|url:%s|trans:%s|reqcred:%v|args:%s|envvars:%s",
+				env.MCPTool.Name, env.MCPTool.Command, env.MCPTool.URL, env.MCPTool.Transport, env.MCPTool.RequiresCredential,
+				strings.Join(args, ","), strings.Join(envVars, ","))
 		}
 	}
 
