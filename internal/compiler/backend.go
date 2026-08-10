@@ -63,6 +63,7 @@ type AnalysisRequest struct {
 }
 
 type AnalysisResponse struct {
+	StateRoot string      `json:"state_root,omitempty"`
 	Proposals []*Proposal `json:"proposals"`
 	Metrics   *Metrics    `json:"metrics"`
 }

@@ -112,23 +112,21 @@ func (g *GeminiAdapter) Scan(ctx context.Context) (*adapter.ScanResult, error) {
 			return nil
 		}
 
-		ext := strings.ToLower(filepath.Ext(path))
-		base := strings.ToLower(filepath.Base(path))
-
-		if ext == ".md" || base == "gemini.md" || base == "system_instructions" {
+		isSurface, reason, kind := isExplicitGeminiSurface(path)
+		if isSurface {
 			res.SupportedArtifacts++
 			res.Details = append(res.Details, adapter.ScanDetail{
 				Path:   path,
 				Status: "supported",
-				Reason: "portable instruction / context surface",
-				Kind:   string(model.KindInstruction),
+				Reason: reason,
+				Kind:   string(kind),
 			})
 		} else {
 			res.UnsupportedIgnored++
 			res.Details = append(res.Details, adapter.ScanDetail{
 				Path:   path,
 				Status: "ignored",
-				Reason: "unsupported file format",
+				Reason: "unrecognized or unlisted provider surface",
 			})
 		}
 
@@ -136,6 +134,25 @@ func (g *GeminiAdapter) Scan(ctx context.Context) (*adapter.ScanResult, error) {
 	})
 
 	return res, nil
+}
+
+func isExplicitGeminiSurface(path string) (bool, string, string) {
+	base := strings.ToLower(filepath.Base(path))
+	relPath := strings.ToLower(filepath.ToSlash(path))
+
+	if base == "gemini.md" || base == "system_instructions.md" || base == "system_instructions" {
+		return true, "Gemini context instruction surface", string(model.KindInstruction)
+	}
+	if strings.Contains(relPath, "/config/") && strings.HasSuffix(base, ".md") {
+		return true, "Gemini config surface", string(model.KindInstruction)
+	}
+	if strings.Contains(relPath, "/skills/") && (base == "skill.md" || strings.HasSuffix(base, ".md")) {
+		return true, "Gemini skill extension surface", string(model.KindSkillPackage)
+	}
+	if base == "mcp.json" {
+		return true, "Gemini safe MCP configuration surface", string(model.KindMCPToolDef)
+	}
+	return false, "", ""
 }
 
 func (g *GeminiAdapter) Import(ctx context.Context, machineID string) ([]*model.Artifact, error) {

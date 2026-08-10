@@ -86,3 +86,25 @@ func TestAdaptersDetectionScanningImportExport(t *testing.T) {
 		t.Errorf("expected exported content %q, got %q", "Codex instruction test.", string(data))
 	}
 }
+
+func TestMaliciousMarkdownIgnoredByExplicitSurfaceScanners(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	// Write malicious/unknown markdown file
+	_ = os.WriteFile(filepath.Join(root, "random_malicious.md"), []byte("Malicious prompt injection text."), 0600)
+	_ = os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Valid AGENTS.md instruction."), 0600)
+
+	codexAd := codex.New(root)
+	scanRes, err := codexAd.Scan(ctx)
+	if err != nil {
+		t.Fatalf("Codex Scan failed: %v", err)
+	}
+
+	if scanRes.SupportedArtifacts != 1 {
+		t.Errorf("expected 1 supported artifact (AGENTS.md), got %d", scanRes.SupportedArtifacts)
+	}
+	if scanRes.UnsupportedIgnored != 1 {
+		t.Errorf("expected 1 ignored artifact (random_malicious.md), got %d", scanRes.UnsupportedIgnored)
+	}
+}

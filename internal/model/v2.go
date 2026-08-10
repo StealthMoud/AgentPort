@@ -74,8 +74,52 @@ func (e *EnvelopeV2) Validate() error {
 		return fmt.Errorf("%w: invalid scope %s", ErrInvalidV2Envelope, e.Scope)
 	}
 
+	if e.Scope == ScopeProject && e.ProjectID == "" {
+		return fmt.Errorf("%w: scope project requires project_id", ErrInvalidV2Envelope)
+	}
+
+	if e.Revision < 1 {
+		return fmt.Errorf("%w: revision must be >= 1", ErrInvalidV2Envelope)
+	}
+
+	if e.RevisionHash == "" {
+		return fmt.Errorf("%w: missing revision_hash", ErrInvalidV2Envelope)
+	}
+
 	if e.Sensitivity == SensitivitySecret {
 		return ErrSecretArtifactInStorage
+	}
+
+	switch e.Kind {
+	case KindMemoryV2:
+		if e.Memory == nil {
+			return fmt.Errorf("%w: kind memory requires Memory payload", ErrInvalidV2Envelope)
+		}
+		if e.Memory.Importance < 1 || e.Memory.Importance > 10 {
+			return fmt.Errorf("%w: memory importance must be between 1 and 10", ErrInvalidV2Envelope)
+		}
+		if e.Memory.Confidence < 0.0 || e.Memory.Confidence > 1.0 {
+			return fmt.Errorf("%w: memory confidence must be between 0.0 and 1.0", ErrInvalidV2Envelope)
+		}
+	case KindSourceRecord:
+		if e.SourceRecord == nil {
+			return fmt.Errorf("%w: kind source_record requires SourceRecord payload", ErrInvalidV2Envelope)
+		}
+	case KindSkillPackage:
+		if e.Skill == nil {
+			return fmt.Errorf("%w: kind skill requires Skill payload", ErrInvalidV2Envelope)
+		}
+		if e.Skill.TrustState != SkillTrustUntrusted && e.Skill.TrustState != SkillTrustTrusted && e.Skill.TrustState != SkillTrustLocalOrigin {
+			return fmt.Errorf("%w: invalid skill trust state %s", ErrInvalidV2Envelope, e.Skill.TrustState)
+		}
+	case KindAgentDef:
+		if e.Agent == nil {
+			return fmt.Errorf("%w: kind agent requires Agent payload", ErrInvalidV2Envelope)
+		}
+	case KindMCPToolDef:
+		if e.MCPTool == nil {
+			return fmt.Errorf("%w: kind tool_definition requires MCPTool payload", ErrInvalidV2Envelope)
+		}
 	}
 
 	return nil
@@ -195,4 +239,12 @@ type MCPToolDef struct {
 	EnvVarNames        []string `json:"env_var_names,omitempty"`
 	WorkingDirPolicy   string   `json:"working_dir_policy,omitempty"`
 	RequiresCredential bool     `json:"requires_credential"`
+}
+
+type Tombstone struct {
+	EntityID             string    `json:"entity_id"`
+	DeletedRevision      int       `json:"deleted_revision"`
+	DeletedAt            time.Time `json:"deleted_at"`
+	OriginMachineID      string    `json:"origin_machine_id"`
+	PreviousRevisionHash string    `json:"previous_revision_hash"`
 }

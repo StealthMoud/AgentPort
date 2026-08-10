@@ -1,11 +1,13 @@
 package vault_test
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/StealthMoud/AgentPort/internal/config"
+	"github.com/StealthMoud/AgentPort/internal/crypt"
 	"github.com/StealthMoud/AgentPort/internal/model"
 	"github.com/StealthMoud/AgentPort/internal/vault"
 )
@@ -186,5 +188,122 @@ func TestVaultTransactionsCommitAndRollback(t *testing.T) {
 
 	if _, exists := v.GetArtifact(art2.ID); !exists {
 		t.Errorf("committed artifact should exist in vault")
+	}
+}
+
+func TestVaultTransactionFaultInjection(t *testing.T) {
+	faultPhases := []string{"pre_staging", "during_write", "after_writes", "during_delete", "pre_commit"}
+
+	for _, phase := range faultPhases {
+		t.Run("FaultAt_"+phase, func(t *testing.T) {
+			tempDir := t.TempDir()
+			homeDir := filepath.Join(tempDir, "agentport_home")
+			vaultDir := filepath.Join(tempDir, "agentport_vault")
+
+			t.Setenv(config.EnvAppHome, homeDir)
+			t.Setenv(config.EnvVaultDir, vaultDir)
+
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("config.Load failed: %v", err)
+			}
+
+			v, err := vault.Initialize(cfg)
+			if err != nil {
+				t.Fatalf("vault.Initialize failed: %v", err)
+			}
+
+			origArt := &model.Artifact{
+				SchemaVersion: model.SchemaVersionV1,
+				Kind:          model.KindMemory,
+				Scope:         model.ScopeGlobal,
+				Title:         "Original Vault Item",
+				Content:       "Initial State",
+				Sensitivity:   model.SensitivityNormal,
+			}
+			if err := v.SaveArtifact(origArt); err != nil {
+				t.Fatalf("SaveArtifact failed: %v", err)
+			}
+
+			tx := v.BeginTx()
+			newArt := &model.Artifact{
+				SchemaVersion: model.SchemaVersionV1,
+				Kind:          model.KindInstruction,
+				Scope:         model.ScopeGlobal,
+				Title:         "Fault Injected Item",
+				Content:       "Should Never Persist",
+				Sensitivity:   model.SensitivityNormal,
+			}
+			_ = tx.SaveArtifact(newArt)
+			_ = tx.DeleteArtifact(origArt.ID)
+
+			err = tx.CommitWithFaultHook(func(p string) error {
+				if p == phase {
+					return fmt.Errorf("injected fault at %s", p)
+				}
+				return nil
+			})
+
+			if err == nil {
+				t.Fatalf("expected commit error for injected fault phase %s", phase)
+			}
+
+			// Verify original vault state remains 100% untouched
+			item, exists := v.GetArtifact(origArt.ID)
+			if !exists {
+				t.Fatalf("original artifact was deleted despite transaction failure at phase %s", phase)
+			}
+			if item.Content != "Initial State" {
+				t.Fatalf("original artifact content corrupted at phase %s: got %s", phase, item.Content)
+			}
+			if _, newExists := v.GetArtifact(newArt.ID); newExists {
+				t.Fatalf("new artifact persisted despite transaction failure at phase %s", phase)
+			}
+		})
+	}
+}
+
+func TestVaultKeyRecipientCompatibility(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "agentport_home")
+	vaultDir := filepath.Join(tempDir, "agentport_vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load failed: %v", err)
+	}
+
+	v, err := vault.Initialize(cfg)
+	if err != nil {
+		t.Fatalf("vault.Initialize failed: %v", err)
+	}
+
+	// 1. Correct vault key re-load
+	v2, err := vault.LoadOpen(cfg)
+	if err != nil {
+		t.Fatalf("expected LoadOpen with correct key to succeed, got: %v", err)
+	}
+	if v2.Metadata.Recipient != v.Metadata.Recipient {
+		t.Errorf("expected matching recipient")
+	}
+
+	// 2. Different key attempt
+	diffKeyDir := filepath.Join(tempDir, "diff_keys")
+	t.Setenv(config.EnvKeysDir, diffKeyDir)
+
+	diffCfg, _ := config.Load()
+	_ = diffCfg.EnsureDirectories()
+	diffKey, err := crypt.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair failed: %v", err)
+	}
+	_ = crypt.SaveIdentityToFile(diffKey.Identity, filepath.Join(diffKeyDir, "identity.age"))
+
+	_, err = vault.LoadOpen(diffCfg)
+	if err == nil {
+		t.Fatalf("expected LoadOpen with different key to fail recipient mismatch check")
 	}
 }

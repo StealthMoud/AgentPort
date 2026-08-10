@@ -277,13 +277,31 @@ func (v *Vault) ListArtifactCopies() []*model.Artifact {
 	return v.ListArtifacts()
 }
 
-// DeleteArtifact deletes artifact by ID.
+// DeleteArtifact deletes artifact by ID and records a tombstone.
 func (v *Vault) DeleteArtifact(id string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	var prevHash string
+	if art, ok := v.artifacts[id]; ok {
+		prevHash = art.Fingerprint
+	}
+
 	artPath := filepath.Join(v.cfg.VaultDir, "artifacts", id+".json")
 	_ = os.Remove(artPath)
 	delete(v.artifacts, id)
+
+	tombDir := filepath.Join(v.cfg.VaultDir, "tombstones")
+	_ = os.MkdirAll(tombDir, 0700)
+	ts := &model.Tombstone{
+		EntityID:             id,
+		DeletedRevision:      1,
+		DeletedAt:            time.Now(),
+		OriginMachineID:      v.Machine.MachineID,
+		PreviousRevisionHash: prevHash,
+	}
+	data, _ := json.MarshalIndent(ts, "", "  ")
+	_ = fsutil.WriteFileAtomic(filepath.Join(tombDir, id+".json"), data, 0600)
+
 	return nil
 }

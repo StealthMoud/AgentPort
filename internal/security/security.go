@@ -32,10 +32,10 @@ type SecurityCheckResult struct {
 // Regex patterns for detecting secrets in content.
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`-----BEGIN [A-Z0-9 ]+ PRIVATE KEY-----`),
-	regexp.MustCompile(`AGE-SECRET-KEY-1[0-9A-Z]{58}`),
+	regexp.MustCompile(`(?i)AGE-SECRET-KEY-1[a-z0-9]{50,}`),
 	regexp.MustCompile(`ghp_[a-zA-Z0-9]{36}`),
 	regexp.MustCompile(`gho_[a-zA-Z0-9]{36}`),
-	regexp.MustCompile(`github_pat_[a-zA-Z0-9_]{82}`),
+	regexp.MustCompile(`github_pat_[a-zA-Z0-9_]{60,}`),
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
 	regexp.MustCompile(`(?i)aws_secret_access_key\s*=\s*[a-zA-Z0-9/+=]{40}`),
 	regexp.MustCompile(`(?i)bearer\s+ey[a-zA-Z0-9_-]{15,}\.ey[a-zA-Z0-9_-]{15,}`),
@@ -117,6 +117,47 @@ func ValidateArtifactSecurity(art *model.Artifact) error {
 		hasSubSecret, subReason := ScanContentForSecrets(fileContent)
 		if hasSubSecret {
 			return fmt.Errorf("%w: file %s (%s)", ErrSecretDetected, fileName, subReason)
+		}
+	}
+
+	return nil
+}
+
+// ValidateEnvelopeSecurity performs comprehensive security check on a Schema V2 Envelope.
+func ValidateEnvelopeSecurity(env *model.EnvelopeV2) error {
+	if env.Sensitivity == model.SensitivitySecret {
+		return ErrSecretDetected
+	}
+
+	if env.SourceRecord != nil {
+		hasSecret, reason := ScanContentForSecrets(env.SourceRecord.Content)
+		if hasSecret {
+			return fmt.Errorf("%w: source record content (%s)", ErrSecretDetected, reason)
+		}
+		for fName, fContent := range env.SourceRecord.Files {
+			if res := InspectFileName(fName); res.Decision == DecisionReject {
+				return fmt.Errorf("%w: file %s (%s)", ErrDisallowedFile, fName, res.Reason)
+			}
+			if hasSubSecret, subReason := ScanContentForSecrets(fContent); hasSubSecret {
+				return fmt.Errorf("%w: file %s (%s)", ErrSecretDetected, fName, subReason)
+			}
+		}
+	}
+
+	if env.Memory != nil {
+		if hasSecret, reason := ScanContentForSecrets(env.Memory.Statement); hasSecret {
+			return fmt.Errorf("%w: memory statement (%s)", ErrSecretDetected, reason)
+		}
+	}
+
+	if env.Skill != nil {
+		if hasSecret, reason := ScanContentForSecrets(env.Skill.SkillMD); hasSecret {
+			return fmt.Errorf("%w: skill md (%s)", ErrSecretDetected, reason)
+		}
+		for sName, sContent := range env.Skill.Scripts {
+			if hasSecret, reason := ScanContentForSecrets(sContent); hasSecret {
+				return fmt.Errorf("%w: script %s (%s)", ErrSecretDetected, sName, reason)
+			}
 		}
 	}
 

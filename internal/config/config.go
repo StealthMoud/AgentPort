@@ -8,6 +8,7 @@ import (
 const (
 	EnvAppHome  = "AGENTPORT_HOME"
 	EnvVaultDir = "AGENTPORT_VAULT"
+	EnvKeysDir  = "AGENTPORT_KEYS"
 
 	DefaultDirName = ".agentport"
 )
@@ -37,11 +38,16 @@ func Load() (*Config, error) {
 		vault = filepath.Join(home, "vault")
 	}
 
+	keys := os.Getenv(EnvKeysDir)
+	if keys == "" {
+		keys = filepath.Join(home, "keys")
+	}
+
 	cfg := &Config{
 		HomeDir:      home,
 		VaultDir:     vault,
 		SyncRepoDir:  filepath.Join(home, "sync_repo"),
-		KeysDir:      filepath.Join(home, "keys"),
+		KeysDir:      keys,
 		SnapshotsDir: filepath.Join(home, "snapshots"),
 	}
 

@@ -112,23 +112,21 @@ func (c *CodexAdapter) Scan(ctx context.Context) (*adapter.ScanResult, error) {
 			return nil
 		}
 
-		ext := strings.ToLower(filepath.Ext(path))
-		base := strings.ToLower(filepath.Base(path))
-
-		if ext == ".md" || ext == ".txt" || base == "instructions" || base == "config" {
+		isSurface, reason, kind := isExplicitCodexSurface(path)
+		if isSurface {
 			res.SupportedArtifacts++
 			res.Details = append(res.Details, adapter.ScanDetail{
 				Path:   path,
 				Status: "supported",
-				Reason: "portable instruction / prompt surface",
-				Kind:   string(model.KindInstruction),
+				Reason: reason,
+				Kind:   string(kind),
 			})
 		} else {
 			res.UnsupportedIgnored++
 			res.Details = append(res.Details, adapter.ScanDetail{
 				Path:   path,
 				Status: "ignored",
-				Reason: "unsupported file format",
+				Reason: "unrecognized or unlisted provider surface",
 			})
 		}
 
@@ -136,6 +134,28 @@ func (c *CodexAdapter) Scan(ctx context.Context) (*adapter.ScanResult, error) {
 	})
 
 	return res, nil
+}
+
+func isExplicitCodexSurface(path string) (bool, string, string) {
+	base := strings.ToLower(filepath.Base(path))
+	relPath := strings.ToLower(filepath.ToSlash(path))
+
+	if base == "agents.md" {
+		return true, "Codex AGENTS.md instruction surface", string(model.KindInstruction)
+	}
+	if base == "instructions" || base == "instructions.md" || base == "config" {
+		return true, "Codex system instructions surface", string(model.KindInstruction)
+	}
+	if strings.Contains(relPath, "/skills/") && (base == "skill.md" || base == "skill.json") {
+		return true, "Codex skill package surface", string(model.KindSkillPackage)
+	}
+	if strings.Contains(relPath, "/agents/") && strings.HasSuffix(base, ".toml") {
+		return true, "Codex agent definition surface", string(model.KindAgentDef)
+	}
+	if base == "mcp.json" {
+		return true, "Codex safe MCP configuration surface", string(model.KindMCPToolDef)
+	}
+	return false, "", ""
 }
 
 func (c *CodexAdapter) Import(ctx context.Context, machineID string) ([]*model.Artifact, error) {

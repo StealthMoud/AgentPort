@@ -2,6 +2,7 @@ package gitstore_test
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -71,5 +72,34 @@ func TestGitStoreSyncLocalEncryptedRepo(t *testing.T) {
 	validation := v.Validate()
 	if !validation.Healthy {
 		t.Fatalf("vault validation after sync failed: %v", validation.Errors)
+	}
+}
+
+func TestDryRunFilesystemPurity(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	syncRepoDir := filepath.Join(tempDir, "sync_repo")
+
+	t.Setenv(config.EnvAppHome, tempDir)
+	t.Setenv(config.EnvVaultDir, filepath.Join(tempDir, "vault"))
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load failed: %v", err)
+	}
+
+	store := gitstore.New(cfg)
+	res, err := store.Sync(ctx, nil, true)
+	if err != nil {
+		t.Fatalf("dry run sync failed: %v", err)
+	}
+
+	if !res.DryRun {
+		t.Errorf("expected DryRun=true in result")
+	}
+
+	// Verify syncRepoDir was NOT created by dry-run
+	if _, err := os.Stat(syncRepoDir); !os.IsNotExist(err) {
+		t.Fatalf("dry-run initialized syncRepoDir on disk: %s", syncRepoDir)
 	}
 }

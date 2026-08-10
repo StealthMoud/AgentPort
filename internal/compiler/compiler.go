@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/StealthMoud/AgentPort/internal/model"
+	"github.com/StealthMoud/AgentPort/internal/security"
 	"github.com/StealthMoud/AgentPort/internal/vault"
 )
 
@@ -37,7 +39,43 @@ func ComputeStateRoot(artifacts []*model.Artifact) string {
 	return model.ComputeFingerprint(model.KindMemory, model.ScopeGlobal, "vault_state_root", totalFingerprints, nil)
 }
 
-// Analyze runs the memory compiler against the vault and returns proposed semantic operations.
+// ValidateProposal performs strict untrusted model output validation.
+func ValidateProposal(prop *Proposal, validIDs map[string]bool, stateRoot string) error {
+	if prop.ID == "" {
+		return fmt.Errorf("%w: proposal missing ID", ErrInvalidProposal)
+	}
+
+	switch prop.Operation {
+	case OpCreate, OpMerge, OpRefine, OpSupersede, OpArchive, OpMarkConflict, OpMarkStale, OpReclassify:
+		// Valid enum
+	default:
+		return fmt.Errorf("%w: invalid operation %s", ErrInvalidProposal, prop.Operation)
+	}
+
+	if prop.Confidence < 0.0 || prop.Confidence > 1.0 {
+		return fmt.Errorf("%w: confidence %.2f out of bounds [0, 1]", ErrInvalidProposal, prop.Confidence)
+	}
+
+	// Verify all target IDs exist in validIDs map (reject hallucinated target IDs)
+	for _, targetID := range prop.TargetIDs {
+		if !validIDs[targetID] {
+			return fmt.Errorf("%w: target ID %s does not exist in vault (hallucination rejected)", ErrInvalidProposal, targetID)
+		}
+	}
+
+	// Security scan proposed state for prompt injection / secrets / shell code
+	if hasSecret, reason := security.ScanContentForSecrets(prop.ProposedState); hasSecret {
+		return fmt.Errorf("%w: proposed state contained secret: %s", ErrInvalidProposal, reason)
+	}
+
+	if strings.Contains(prop.ProposedState, "<script>") || strings.Contains(prop.ProposedState, "eval(") {
+		return fmt.Errorf("%w: proposed state contained disallowed script code", ErrInvalidProposal)
+	}
+
+	return nil
+}
+
+// Analyze runs the memory compiler against the vault, enforcing privacy policies and strict proposal validation.
 func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope model.Scope) (*AnalysisResponse, error) {
 	if err := mc.backend.Health(ctx); err != nil {
 		return nil, fmt.Errorf("memory compiler backend health check failed: %w", err)
@@ -45,13 +83,19 @@ func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope mod
 
 	artifacts := v.ListArtifacts()
 	filtered := make([]*model.Artifact, 0, len(artifacts))
+	validIDs := make(map[string]bool)
 
 	for _, art := range artifacts {
+		// Privacy policy enforcement: SensitivitySecret is NEVER sent to any model backend
+		if art.Sensitivity == model.SensitivitySecret {
+			continue
+		}
 		if scope != "" && art.Scope != scope {
 			continue
 		}
 		if art.Kind == model.KindMemory || art.Kind == model.KindPreference || art.Kind == model.KindInstruction {
 			filtered = append(filtered, art)
+			validIDs[art.ID] = true
 		}
 	}
 
@@ -68,15 +112,23 @@ func (mc *MemoryCompiler) Analyze(ctx context.Context, v *vault.Vault, scope mod
 		return nil, fmt.Errorf("backend analysis failed: %w", err)
 	}
 
-	// Validate all returned proposals
+	validatedProposals := make([]*Proposal, 0, len(res.Proposals))
 	for _, prop := range res.Proposals {
 		if prop.ID == "" {
 			prop.ID = model.GenerateEntityID("prop")
 		}
-		if prop.InputStateRoot == "" {
-			prop.InputStateRoot = stateRoot
+		prop.InputStateRoot = stateRoot
+		prop.Backend = mc.backend.Name()
+
+		if err := ValidateProposal(prop, validIDs, stateRoot); err != nil {
+			// Skip unvalidated or hallucinated proposals safely
+			continue
 		}
+
+		validatedProposals = append(validatedProposals, prop)
 	}
 
+	res.StateRoot = stateRoot
+	res.Proposals = validatedProposals
 	return res, nil
 }

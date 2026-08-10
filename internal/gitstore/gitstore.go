@@ -30,6 +30,7 @@ type ManifestObject struct {
 	Fingerprint   string    `json:"fingerprint"`
 	EncryptedSize int64     `json:"encrypted_size"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	IsTombstone   bool      `json:"is_tombstone,omitempty"`
 }
 
 type Manifest struct {
@@ -120,6 +121,18 @@ func (s *Store) GetRemote(ctx context.Context) (string, error) {
 
 // Sync performs encrypted vault synchronization.
 func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncResult, error) {
+	if dryRun {
+		res := &SyncResult{
+			Status: SyncStatusSuccess,
+			DryRun: true,
+		}
+		if v != nil {
+			artifacts := v.ListArtifacts()
+			res.ObjectsEncryptedCount = len(artifacts)
+		}
+		return res, nil
+	}
+
 	if err := s.EnsureRepo(ctx); err != nil {
 		return nil, err
 	}
@@ -244,6 +257,23 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 		}
 	}
 
+	// 6. Record local tombstones in manifest
+	if tombstones, err := v.ListTombstones(); err == nil {
+		for _, ts := range tombstones {
+			existingObj, exists := manifest.Objects[ts.EntityID]
+			if !exists || !existingObj.IsTombstone {
+				opaqueID := model.ComputeFingerprint(model.KindMemory, model.ScopeGlobal, ts.EntityID, "tombstone", nil)[:24]
+				manifest.Objects[ts.EntityID] = &ManifestObject{
+					OpaqueID:    opaqueID,
+					Fingerprint: ts.PreviousRevisionHash,
+					UpdatedAt:   ts.DeletedAt,
+					IsTombstone: true,
+				}
+				changedCount++
+			}
+		}
+	}
+
 	res.ObjectsEncryptedCount = changedCount
 
 	if dryRun {
@@ -261,24 +291,18 @@ func (s *Store) Sync(ctx context.Context, v *vault.Vault, dryRun bool) (*SyncRes
 		return nil, err
 	}
 
-	// 6. Commit local changes if anything changed or local is uncommitted
-	status, _ := s.execGit(ctx, "status", "--porcelain")
-	if strings.TrimSpace(status) != "" {
-		_, _ = s.execGit(ctx, "add", "-A")
-		sha, commitErr := s.execGit(ctx, "commit", "-m", "sync: update AgentPort vault")
-		if commitErr == nil {
-			res.CommitSHA = sha
-		}
-	}
-
-	// 7. Push to remote if remote exists and local has commits to push
-	if remoteURL != "" {
-		_, pushErr := s.execGit(ctx, "push", "origin", "HEAD:main")
-		if pushErr != nil {
-			res.Status = SyncStatusPushFailed
-			res.Message = fmt.Sprintf("git push to remote failed: %v", pushErr)
-			res.Warnings = append(res.Warnings, fmt.Sprintf("git push failed: %v", pushErr))
-			return res, fmt.Errorf("git push to remote failed: %w", pushErr)
+	// Commit and push sync repository
+	_, _ = s.execGit(ctx, "add", ".")
+	commitMsg := fmt.Sprintf("Sync vault state: %d objects updated (%s)", res.ObjectsEncryptedCount, time.Now().Format(time.RFC3339))
+	if _, err := s.execGit(ctx, "commit", "-m", commitMsg); err == nil {
+		res.LocalAhead = true
+		if remoteURL != "" {
+			if _, pushErr := s.execGit(ctx, "push", "origin", "HEAD:main"); pushErr != nil {
+				res.Status = SyncStatusPushFailed
+				res.Message = fmt.Sprintf("git push to remote failed: %v", pushErr)
+				res.Warnings = append(res.Warnings, fmt.Sprintf("git push failed: %v", pushErr))
+				return res, fmt.Errorf("git push to remote failed: %w", pushErr)
+			}
 		}
 	}
 
@@ -310,6 +334,14 @@ func (s *Store) decryptObjectsIntoVault(v *vault.Vault) (int, error) {
 
 	for _, artID := range keys {
 		obj := manifest.Objects[artID]
+		if obj.IsTombstone {
+			_ = v.DeleteArtifact(artID)
+			continue
+		}
+		if _, isTomb := v.GetTombstone(artID); isTomb {
+			_ = v.DeleteArtifact(artID)
+			continue
+		}
 		objFile := filepath.Join(objectsDir, obj.OpaqueID+".age")
 		ciphertext, err := os.ReadFile(objFile)
 		if err != nil {

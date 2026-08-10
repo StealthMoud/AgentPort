@@ -112,23 +112,21 @@ func (c *ClaudeAdapter) Scan(ctx context.Context) (*adapter.ScanResult, error) {
 			return nil
 		}
 
-		ext := strings.ToLower(filepath.Ext(path))
-		base := strings.ToLower(filepath.Base(path))
-
-		if ext == ".md" || base == "claude.md" || base == "instructions" {
+		isSurface, reason, kind := isExplicitClaudeSurface(path)
+		if isSurface {
 			res.SupportedArtifacts++
 			res.Details = append(res.Details, adapter.ScanDetail{
 				Path:   path,
 				Status: "supported",
-				Reason: "portable instruction / memory surface",
-				Kind:   string(model.KindInstruction),
+				Reason: reason,
+				Kind:   string(kind),
 			})
 		} else {
 			res.UnsupportedIgnored++
 			res.Details = append(res.Details, adapter.ScanDetail{
 				Path:   path,
 				Status: "ignored",
-				Reason: "unsupported file format",
+				Reason: "unrecognized or unlisted provider surface",
 			})
 		}
 
@@ -136,6 +134,31 @@ func (c *ClaudeAdapter) Scan(ctx context.Context) (*adapter.ScanResult, error) {
 	})
 
 	return res, nil
+}
+
+func isExplicitClaudeSurface(path string) (bool, string, string) {
+	base := strings.ToLower(filepath.Base(path))
+	relPath := strings.ToLower(filepath.ToSlash(path))
+
+	if base == "claude.md" {
+		return true, "Claude CLAUDE.md instruction surface", string(model.KindInstruction)
+	}
+	if strings.Contains(relPath, "/rules/") && strings.HasSuffix(base, ".md") {
+		return true, "Claude project rule surface", string(model.KindInstruction)
+	}
+	if strings.Contains(relPath, "/memory/") && strings.HasSuffix(base, ".md") {
+		return true, "Claude auto-memory surface", string(model.KindMemory)
+	}
+	if strings.Contains(relPath, "/skills/") && (base == "skill.md" || base == "skill.json" || strings.HasSuffix(base, ".md")) {
+		return true, "Claude skill surface", string(model.KindSkillPackage)
+	}
+	if strings.Contains(relPath, "/agents/") && (strings.HasSuffix(base, ".json") || strings.HasSuffix(base, ".md")) {
+		return true, "Claude agent definition surface", string(model.KindAgentDef)
+	}
+	if base == ".mcp.json" || base == "mcp.json" {
+		return true, "Claude safe MCP configuration surface", string(model.KindMCPToolDef)
+	}
+	return false, "", ""
 }
 
 func (c *ClaudeAdapter) Import(ctx context.Context, machineID string) ([]*model.Artifact, error) {
