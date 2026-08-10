@@ -1,7 +1,10 @@
 package governance
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/StealthMoud/AgentPort/internal/compiler"
 	"github.com/StealthMoud/AgentPort/internal/config"
@@ -10,10 +13,36 @@ import (
 	"github.com/StealthMoud/AgentPort/internal/vault"
 )
 
+var (
+	ErrGovernanceRecoveryFailed = errors.New("governance recovery failed")
+)
+
+type origPropState struct {
+	inMemStatus   compiler.ProposalStatus
+	onDiskProp    *compiler.Proposal
+	existedOnDisk bool
+}
+
 // ApplyProposals transactionally applies a set of memory compiler proposals with strict state root checking and backup snapshot.
 func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Proposal) error {
 	if len(props) == 0 {
 		return nil
+	}
+
+	ps := NewProposalStore(cfg)
+	j := NewJournal(cfg)
+
+	// 0. Capture exact pre-operation proposal states (in-memory & on-disk) for rollback safety.
+	origStates := make(map[string]origPropState, len(props))
+	for _, prop := range props {
+		st := origPropState{
+			inMemStatus: prop.Status,
+		}
+		if existing, ok := ps.GetProposal(prop.ID); ok {
+			st.onDiskProp = existing
+			st.existedOnDisk = true
+		}
+		origStates[prop.ID] = st
 	}
 
 	// 1. Compute V2-aware state root
@@ -197,31 +226,64 @@ func ApplyProposals(v *vault.Vault, cfg *config.Config, props []*compiler.Propos
 		return fmt.Errorf("failed committing proposal set application: %w", err)
 	}
 
-	// 5. Audit record. If any audit/proposal persistence fails AFTER the canonical
-	//    state has been committed, we restore the pre-apply snapshot so that the
-	//    canonical state and the audit log stay consistent (fail-closed invariant).
-	j := NewJournal(cfg)
-	ps := NewProposalStore(cfg)
+	// 5. Audit record & proposal store persistence.
+	// If any governance metadata persistence fails AFTER canonical state commit,
+	// we restore the canonical snapshot AND proposal statuses so that ALL state stays
+	// logically pre-operation (atomic fail-closed invariant).
+	var recordedFiles []string
+
+	rollbackGovernance := func(triggerErr error, failedStage string) error {
+		var recoveryErrs []string
+
+		// 1. Restore canonical vault from snapshot
+		if err := snapMgr.RestoreSnapshot(v, snapID); err != nil {
+			recoveryErrs = append(recoveryErrs, fmt.Sprintf("restore snapshot failed: %v", err))
+		}
+
+		// 2. Restore proposal statuses in-memory and on-disk
+		for _, prop := range props {
+			st := origStates[prop.ID]
+			prop.Status = st.inMemStatus
+			if st.existedOnDisk {
+				if err := ps.SaveProposal(st.onDiskProp); err != nil {
+					recoveryErrs = append(recoveryErrs, fmt.Sprintf("restore proposal %s failed: %v", prop.ID, err))
+				}
+			} else {
+				_ = ps.DeleteProposal(prop.ID)
+			}
+		}
+
+		// 3. Remove partial audit records created during this operation
+		for _, f := range recordedFiles {
+			_ = os.Remove(f)
+		}
+
+		if len(recoveryErrs) > 0 {
+			return fmt.Errorf("%w: snapshot %s, failed stage: %s (%s); original error: %v",
+				ErrGovernanceRecoveryFailed, snapID, failedStage, strings.Join(recoveryErrs, "; "), triggerErr)
+		}
+
+		return triggerErr
+	}
 
 	for _, prop := range props {
 		prop.Status = compiler.ProposalStatusAccepted
 		if err := ps.SaveProposal(prop); err != nil {
-			// Restore canonical state from the pre-apply snapshot (fail-closed).
-			snapMgr := snapshot.NewManager(cfg)
-			_ = snapMgr.RestoreSnapshot(v, snapID)
-			return fmt.Errorf("failed saving proposal status for %s (canonical state rolled back to snap %s): %w", prop.ID, snapID, err)
+			return rollbackGovernance(fmt.Errorf("failed saving proposal status for %s: %w", prop.ID, err), "proposal_persistence")
 		}
-		if err := j.RecordEvent(&AuditEvent{
+
+		eventFile, err := j.RecordEventWithFilePath(&AuditEvent{
 			Actor:      "memory_compiler",
 			Operation:  string(prop.Operation),
 			ProposalID: prop.ID,
 			TargetID:   prop.ID,
 			SnapshotID: snapID,
-		}); err != nil {
-			// Restore canonical state from the pre-apply snapshot (fail-closed).
-			snapMgr := snapshot.NewManager(cfg)
-			_ = snapMgr.RestoreSnapshot(v, snapID)
-			return fmt.Errorf("failed recording audit event for %s (canonical state rolled back to snap %s): %w", prop.ID, snapID, err)
+		})
+		if err != nil {
+			return rollbackGovernance(fmt.Errorf("failed recording audit event for %s: %w", prop.ID, err), "audit_persistence")
+		}
+		if eventFile != "" {
+			recordedFiles = append(recordedFiles, eventFile)
 		}
 	}
 

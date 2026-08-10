@@ -1,8 +1,11 @@
 package governance_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -424,5 +427,222 @@ func TestGovernanceApplyFailsWhenSnapshotFails(t *testing.T) {
 
 	if len(v.ListEntities()) != 0 {
 		t.Fatalf("state was mutated despite snapshot failure!")
+	}
+}
+
+func TestProposalStoreFailureRestoresCanonicalAndProposalState(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	// Save initial proposal in store
+	ps := governance.NewProposalStore(cfg)
+	prop := &compiler.Proposal{
+		ID:            "prop_store_fail_test",
+		Operation:     compiler.OpCreate,
+		ProposedState: "New memory statement",
+		Status:        compiler.ProposalStatusPending,
+	}
+	if err := ps.SaveProposal(prop); err != nil {
+		t.Fatalf("SaveProposal failed: %v", err)
+	}
+
+	// Break proposal store by making proposals dir read-only or replacing file with directory
+	propFilePath := filepath.Join(vaultDir, "proposals", prop.ID+".json")
+	_ = os.Remove(propFilePath)
+	_ = os.MkdirAll(propFilePath, 0700) // Replace proposal file with directory to force WriteFileAtomic error
+
+	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{prop})
+	if err == nil {
+		t.Fatalf("expected ApplyProposals to fail when proposal store persistence fails")
+	}
+
+	// Reopen vault: canonical state must be clean (0 entities created)
+	reopened, err := vault.LoadOpen(cfg)
+	if err != nil {
+		t.Fatalf("vault.LoadOpen failed: %v", err)
+	}
+	if len(reopened.ListEntities()) != 0 {
+		t.Errorf("canonical vault state was mutated despite proposal store failure!")
+	}
+
+	// Proposal in-memory status must be restored to Pending
+	if prop.Status != compiler.ProposalStatusPending {
+		t.Errorf("proposal status in memory was left as %s, expected %s", prop.Status, compiler.ProposalStatusPending)
+	}
+}
+
+func TestAuditFailureRestoresCanonicalAndProposalState(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	ps := governance.NewProposalStore(cfg)
+	prop := &compiler.Proposal{
+		ID:            "prop_audit_fail_test",
+		Operation:     compiler.OpCreate,
+		ProposedState: "New memory for audit failure test",
+		Status:        compiler.ProposalStatusPending,
+	}
+	if err := ps.SaveProposal(prop); err != nil {
+		t.Fatalf("SaveProposal failed: %v", err)
+	}
+
+	// Break audit directory by creating a file named 'audit' in vaultDir
+	auditPath := filepath.Join(vaultDir, "audit")
+	_ = os.RemoveAll(auditPath)
+	_ = os.WriteFile(auditPath, []byte("NOT A DIRECTORY"), 0600)
+
+	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{prop})
+	if err == nil {
+		t.Fatalf("expected ApplyProposals to fail when audit persistence fails")
+	}
+
+	// Reopen vault: canonical state must be clean
+	reopened, err := vault.LoadOpen(cfg)
+	if err != nil {
+		t.Fatalf("vault.LoadOpen failed: %v", err)
+	}
+	if len(reopened.ListEntities()) != 0 {
+		t.Errorf("canonical vault state was mutated despite audit persistence failure!")
+	}
+
+	// Proposal on disk must be restored to Pending
+	_ = os.Remove(auditPath) // remove file block so we can read proposal store
+	retrieved, ok := ps.GetProposal(prop.ID)
+	if !ok {
+		t.Fatalf("proposal missing from proposal store after audit failure rollback")
+	}
+	if retrieved.Status != compiler.ProposalStatusPending {
+		t.Errorf("proposal status on disk was %s, expected %s", retrieved.Status, compiler.ProposalStatusPending)
+	}
+}
+
+func TestGovernanceRecoveryFailureIsExplicit(t *testing.T) {
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	vaultDir := filepath.Join(tempDir, "vault")
+
+	t.Setenv(config.EnvAppHome, homeDir)
+	t.Setenv(config.EnvVaultDir, vaultDir)
+
+	cfg, _ := config.Load()
+	v, _ := vault.Initialize(cfg)
+
+	prop := &compiler.Proposal{
+		ID:            "prop_recovery_fail_test",
+		Operation:     compiler.OpCreate,
+		ProposedState: "Statement causing recovery failure",
+		Status:        compiler.ProposalStatusPending,
+	}
+
+	// Force proposal persistence to fail
+	propFilePath := filepath.Join(vaultDir, "proposals", prop.ID+".json")
+	_ = os.MkdirAll(filepath.Dir(propFilePath), 0700)
+	_ = os.MkdirAll(propFilePath, 0700)
+
+	// Break snapshot restore by corrupting snapshots dir after snapshot creation
+	// We run ApplyProposals in a goroutine or break snapshots dir right before
+	// Actually, we can make snapshotsDir a file right after snapshot is created?
+	// Or we can corrupt the snapshot file inside snapshotsDir after it's created!
+	// A simpler way: make snapshotsDir a read-only directory or corrupt the snapshot metadata file!
+	// Let's break the snapshot metadata file right before ApplyProposals or during a hook.
+	// Since CreateSnapshot creates a snapshot subfolder in snapshotsDir, if we replace cfg.SnapshotsDir with a file AFTER CreateSnapshot or break permissions, restore will fail.
+	// Wait, we can test ErrGovernanceRecoveryFailed by removing the created snapshot directory right before restore.
+	// How? Let's break snapshotsDir permissions or replace it!
+	// If we replace cfg.SnapshotsDir with a file, CreateSnapshot fails.
+	// But if we let CreateSnapshot succeed, then delete snapshotsDir and put a file there, restore fails!
+
+	// Let's test this directly by wrapping proposal store save:
+	// If we make `snapshotsDir` a file AFTER tx.Commit(), CreateSnapshot already ran (step 3).
+	// But wait! ApplyProposals runs sequentially in single thread:
+	// step 3: CreateSnapshot -> creates `snapshots/snap_...`
+	// step 4: tx.Commit() -> mutates vault
+	// step 5: SaveProposal -> fails (because propFilePath is a dir) -> calls rollbackGovernance
+	// inside rollbackGovernance -> RestoreSnapshot tries to read `snapshots/snap_...`
+	// If we remove `snapshots` directory before step 5?
+	// Wait! We can make propFilePath a dir, AND in a custom test setup we can corrupt the snapshot file!
+	// Wait, if we replace `snapshots` directory right before calling ApplyProposals... wait, CreateSnapshot would fail.
+	// How to make CreateSnapshot succeed but RestoreSnapshot fail?
+	// In Go tests, we can remove the created snapshot subfolder if we know its name? No, snapID is generated dynamically.
+	// BUT `snapshotsDir` contains the snapshot subfolders! If we remove `snapshotsDir` completely after snapshot creation?
+	// Wait! Can we corrupt `v.cfg.SnapshotsDir` by removing all contents inside `SnapshotsDir` after snapshot is created?
+	// No, ApplyProposals runs synchronously.
+	// Wait! `v` in memory has `v.cfg`. If we pass a modified `cfg` or if `snapshotsDir` is on a path where `RestoreSnapshot` encounters an unreadable file?
+	// If `RestoreSnapshot` cannot find the snapshot ID or if `snapshotsDir/snap_ID/snapshot.json` is missing/corrupt, `RestoreSnapshot` returns `ErrSnapshotNotFound`!
+	// So if we delete `snapshots` directory inside `v.cfg.VaultDir`... wait! Can we trigger this by removing `snapshots` directory?
+	// Since ApplyProposals is synchronous, how can we remove `snapshots` after `CreateSnapshot` but before `RestoreSnapshot`?
+	// We can hook into `v.BeginTx()`! When `BeginTx()` is called, `CreateSnapshot` has ALREADY completed!
+	// In `BeginTx()`, we can remove `cfg.SnapshotsDir`!
+	// Let's verify:
+	// Step 3: snapMgr.CreateSnapshot(v, ...) -> done!
+	// Step 4: v.BeginTx() -> called! Here we can remove `cfg.SnapshotsDir` and replace it with a file!
+	// Step 4.5: tx.Commit() -> succeeds!
+	// Step 5: ps.SaveProposal(prop) -> fails (propFilePath is dir) -> rollbackGovernance -> RestoreSnapshot fails! -> returns ErrGovernanceRecoveryFailed!
+
+	// Let's test this exact hook:
+	// Remove snapshots dir right after tx is created, or override!
+	// Since `v.BeginTx()` is called during `ApplyProposals`, we can remove `cfg.SnapshotsDir` inside a wrapper or test setup.
+
+	// Let's test:
+	_ = os.RemoveAll(cfg.SnapshotsDir)
+	_ = os.MkdirAll(cfg.SnapshotsDir, 0700)
+
+	// Watch for CreateSnapshot to finish writing snapshot.json, then delete the snapshot subfolder
+	// so that RestoreSnapshot will fail when rollbackGovernance is triggered.
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				entries, err := os.ReadDir(cfg.SnapshotsDir)
+				if err == nil {
+					for _, entry := range entries {
+						if entry.IsDir() {
+							metaFile := filepath.Join(cfg.SnapshotsDir, entry.Name(), "snapshot.json")
+							if _, statErr := os.Stat(metaFile); statErr == nil {
+								// Snapshot creation is 100% complete. Delete the snapshot folder so restore fails.
+								_ = os.RemoveAll(filepath.Join(cfg.SnapshotsDir, entry.Name()))
+								return
+							}
+						}
+					}
+				}
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	err := governance.ApplyProposals(v, cfg, []*compiler.Proposal{prop})
+	close(done)
+
+	// Clean up file if created so TempDir cleanup succeeds
+	_ = os.RemoveAll(cfg.SnapshotsDir)
+
+	if err == nil {
+		t.Fatalf("expected ApplyProposals to fail")
+	}
+
+	if !errors.Is(err, governance.ErrGovernanceRecoveryFailed) {
+		t.Fatalf("expected error to wrap ErrGovernanceRecoveryFailed, got: %v", err)
+	}
+
+	errStr := err.Error()
+	if !strings.Contains(errStr, "snapshot") || !strings.Contains(errStr, "failed stage") {
+		t.Errorf("expected error message to contain snapshot ID and failed stage, got: %s", errStr)
 	}
 }

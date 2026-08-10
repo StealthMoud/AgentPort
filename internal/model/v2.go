@@ -413,26 +413,110 @@ func (e *EnvelopeV2) Clone() *EnvelopeV2 {
 }
 
 // ComputeRevisionHash calculates a canonical, deterministic revision hash for a V2 entity.
-// It covers semantic state and excludes non-semantic timestamp noise.
+//
+// Inclusion policy:
+//   - All portable semantic state that changes the meaning of the entity is included.
+//   - Non-semantic / machine-local fields are excluded:
+//     MachineID (provenance only), LocalPathRef (local filesystem), ObservedAt (observation
+//     timestamp), Revision counter (monotonic counter — not semantic content).
+//
+// Collection ordering:
+//   - Unordered sets (Tags, Supersedes, ConflictsWith, EnvVarNames, map keys) are sorted
+//     before hashing so that insertion order does not affect the hash.
+//   - IMPORTANT: MCPToolDef.Args are NOT sorted. Command arguments are ordered and
+//     changing their order is a semantic change.
 func ComputeRevisionHash(env *EnvelopeV2) string {
 	var payloadStr string
 
 	switch env.Kind {
 	case KindMemoryV2, KindInstructionV2, KindPreferenceV2, KindProjectContextV2:
 		if env.Memory != nil {
-			payloadStr = fmt.Sprintf("stmt:%s|cat:%s|stat:%s|imp:%d|conf:%.2f|deriv:%s|revst:%s",
-				env.Memory.Statement, env.Memory.Category, env.Memory.Status,
-				env.Memory.Importance, env.Memory.Confidence, env.Memory.Derivation, env.Memory.ReviewState)
+			m := env.Memory
+
+			// Canonicalize validity windows as RFC3339 UTC strings (empty string if nil).
+			validFromStr := ""
+			if m.ValidFrom != nil {
+				validFromStr = m.ValidFrom.UTC().Format("2006-01-02T15:04:05Z")
+			}
+			validUntilStr := ""
+			if m.ValidUntil != nil {
+				validUntilStr = m.ValidUntil.UTC().Format("2006-01-02T15:04:05Z")
+			}
+			lastConfirmedStr := m.LastConfirmedAt.UTC().Format("2006-01-02T15:04:05Z")
+
+			// Sort unordered set fields to guarantee determinism.
+			supersedes := append([]string(nil), m.Supersedes...)
+			sort.Strings(supersedes)
+			conflictsWith := append([]string(nil), m.ConflictsWith...)
+			sort.Strings(conflictsWith)
+
+			// Canonicalize Evidence: sort by SourceRecordID then SourceRevision,
+			// then encode each link as a fixed-format string.
+			type evidenceKey struct {
+				id  string
+				rev int
+			}
+			type evidenceEntry struct {
+				k evidenceKey
+				v EvidenceLink
+			}
+			evEntries := make([]evidenceEntry, len(m.Evidence))
+			for i, ev := range m.Evidence {
+				evEntries[i] = evidenceEntry{k: evidenceKey{ev.SourceRecordID, ev.SourceRevision}, v: ev}
+			}
+			sort.Slice(evEntries, func(i, j int) bool {
+				ki, kj := evEntries[i].k, evEntries[j].k
+				if ki.id != kj.id {
+					return ki.id < kj.id
+				}
+				return ki.rev < kj.rev
+			})
+			evidenceParts := make([]string, len(evEntries))
+			for i, ee := range evEntries {
+				evidenceParts[i] = fmt.Sprintf("%s|%d|%s|%s",
+					ee.v.SourceRecordID, ee.v.SourceRevision, ee.v.ContentHash, ee.v.ExcerptHash)
+			}
+
+			payloadStr = fmt.Sprintf(
+				"stmt:%s|cat:%s|stat:%s|imp:%d|conf:%.4f|deriv:%s|"+
+					"validfrom:%s|validuntil:%s|lastconfirmed:%s|"+
+					"supersedes:%s|conflicts:%s|evidence:%s|revst:%s",
+				m.Statement, m.Category, m.Status,
+				m.Importance, m.Confidence, m.Derivation,
+				validFromStr, validUntilStr, lastConfirmedStr,
+				strings.Join(supersedes, ","),
+				strings.Join(conflictsWith, ","),
+				strings.Join(evidenceParts, ";"),
+				m.ReviewState,
+			)
 		}
+
 	case KindSourceRecord:
 		if env.SourceRecord != nil {
-			payloadStr = fmt.Sprintf("prov:%s|surf:%s|key:%s|hash:%s|stat:%s|content:%s",
-				env.SourceRecord.Provider, env.SourceRecord.SurfaceType, env.SourceRecord.LogicalSourceKey,
-				env.SourceRecord.SourceHash, env.SourceRecord.Status, env.SourceRecord.Content)
+			sr := env.SourceRecord
+			// Include all portable semantic fields.
+			// Excluded: MachineID (local provenance), LocalPathRef (local filesystem path),
+			//           ObservedAt (observation metadata, not content).
+			var fileKeys []string
+			for k := range sr.Files {
+				fileKeys = append(fileKeys, k)
+			}
+			sort.Strings(fileKeys)
+			fileParts := make([]string, len(fileKeys))
+			for i, k := range fileKeys {
+				fileParts[i] = k + "=" + sr.Files[k]
+			}
+			payloadStr = fmt.Sprintf(
+				"prov:%s|surf:%s|key:%s|ctype:%s|content:%s|files:%s|hash:%s|stat:%s|rev:%d|prevrev:%s",
+				sr.Provider, sr.SurfaceType, sr.LogicalSourceKey,
+				sr.ContentType, sr.Content,
+				strings.Join(fileParts, ";"),
+				sr.SourceHash, sr.Status, sr.Revision, sr.PreviousRevision,
+			)
 		}
+
 	case KindSkillPackage:
 		if env.Skill != nil {
-			// Collect and sort script/reference/asset keys for deterministic ordering.
 			var scriptKeys, refKeys, assetKeys []string
 			for k := range env.Skill.Scripts {
 				scriptKeys = append(scriptKeys, k)
@@ -446,20 +530,26 @@ func ComputeRevisionHash(env *EnvelopeV2) string {
 			sort.Strings(scriptKeys)
 			sort.Strings(refKeys)
 			sort.Strings(assetKeys)
-			var scriptParts, refParts, assetParts []string
-			for _, k := range scriptKeys {
-				scriptParts = append(scriptParts, k+"="+env.Skill.Scripts[k])
+			scriptParts := make([]string, len(scriptKeys))
+			refParts := make([]string, len(refKeys))
+			assetParts := make([]string, len(assetKeys))
+			for i, k := range scriptKeys {
+				scriptParts[i] = k + "=" + env.Skill.Scripts[k]
 			}
-			for _, k := range refKeys {
-				refParts = append(refParts, k+"="+env.Skill.References[k])
+			for i, k := range refKeys {
+				refParts[i] = k + "=" + env.Skill.References[k]
 			}
-			for _, k := range assetKeys {
-				assetParts = append(assetParts, k+"="+env.Skill.Assets[k])
+			for i, k := range assetKeys {
+				assetParts[i] = k + "=" + env.Skill.Assets[k]
 			}
 			payloadStr = fmt.Sprintf("name:%s|desc:%s|md:%s|trust:%s|exec:%v|scripts:%s|refs:%s|assets:%s",
-				env.Skill.Name, env.Skill.Description, env.Skill.SkillMD, env.Skill.TrustState, env.Skill.HasExecutables,
-				strings.Join(scriptParts, ";"), strings.Join(refParts, ";"), strings.Join(assetParts, ";"))
+				env.Skill.Name, env.Skill.Description, env.Skill.SkillMD,
+				env.Skill.TrustState, env.Skill.HasExecutables,
+				strings.Join(scriptParts, ";"),
+				strings.Join(refParts, ";"),
+				strings.Join(assetParts, ";"))
 		}
+
 	case KindAgentDef:
 		if env.Agent != nil {
 			caps := append([]string(nil), env.Agent.Capabilities...)
@@ -467,18 +557,26 @@ func ComputeRevisionHash(env *EnvelopeV2) string {
 			sort.Strings(caps)
 			sort.Strings(skills)
 			payloadStr = fmt.Sprintf("name:%s|desc:%s|inst:%s|model:%s|caps:%s|skills:%s",
-				env.Agent.Name, env.Agent.Description, env.Agent.Instructions, env.Agent.PreferredModelClass,
+				env.Agent.Name, env.Agent.Description, env.Agent.Instructions,
+				env.Agent.PreferredModelClass,
 				strings.Join(caps, ","), strings.Join(skills, ","))
 		}
+
 	case KindMCPToolDef:
 		if env.MCPTool != nil {
-			args := append([]string(nil), env.MCPTool.Args...)
+			// Args order is PRESERVED — these are ordered command-line arguments.
+			// Changing arg order is a semantic change and must change the hash.
 			envVars := append([]string(nil), env.MCPTool.EnvVarNames...)
-			sort.Strings(args)
-			sort.Strings(envVars)
-			payloadStr = fmt.Sprintf("name:%s|cmd:%s|url:%s|trans:%s|reqcred:%v|args:%s|envvars:%s",
-				env.MCPTool.Name, env.MCPTool.Command, env.MCPTool.URL, env.MCPTool.Transport, env.MCPTool.RequiresCredential,
-				strings.Join(args, ","), strings.Join(envVars, ","))
+			sort.Strings(envVars) // env var names are a set; order is not significant
+			payloadStr = fmt.Sprintf(
+				"name:%s|cmd:%s|args:%s|url:%s|trans:%s|envvars:%s|wdpol:%s|reqcred:%v",
+				env.MCPTool.Name, env.MCPTool.Command,
+				strings.Join(env.MCPTool.Args, "\x00"), // use NUL separator — args may contain commas
+				env.MCPTool.URL, env.MCPTool.Transport,
+				strings.Join(envVars, ","),
+				env.MCPTool.WorkingDirPolicy,
+				env.MCPTool.RequiresCredential,
+			)
 		}
 	}
 
@@ -501,8 +599,12 @@ func ComputeRevisionHash(env *EnvelopeV2) string {
 		tagsStr = strings.Join(sortedTags, ",")
 	}
 
-	combined := fmt.Sprintf("kind:%s|scope:%s|proj:%s|rev:%d|sens:%s|life:%s|tags:%s|meta:%s|payload:%s",
-		env.Kind, env.Scope, env.ProjectID, env.Revision, env.Sensitivity, env.Lifecycle, tagsStr, metaStr, payloadStr)
+	// NOTE: Revision (monotonic counter) is intentionally excluded — it is not semantic
+	// state. Two entities with different revision counters but identical content have the
+	// same semantic meaning and should produce the same RevisionHash, which lets the
+	// reconciler detect true no-ops even across sync roundtrips.
+	combined := fmt.Sprintf("kind:%s|scope:%s|proj:%s|sens:%s|life:%s|tags:%s|meta:%s|payload:%s",
+		env.Kind, env.Scope, env.ProjectID, env.Sensitivity, env.Lifecycle, tagsStr, metaStr, payloadStr)
 
 	return ComputeFingerprint(KindMemory, ScopeGlobal, "v2_revision", combined, nil)
 }

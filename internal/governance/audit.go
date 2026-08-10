@@ -39,6 +39,12 @@ func NewJournal(cfg *config.Config) *Journal {
 
 // RecordEvent appends an audit event entry to local persistent audit log.
 func (j *Journal) RecordEvent(event *AuditEvent) error {
+	_, err := j.RecordEventWithFilePath(event)
+	return err
+}
+
+// RecordEventWithFilePath appends an audit event entry and returns the written file path.
+func (j *Journal) RecordEventWithFilePath(event *AuditEvent) (string, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -51,16 +57,20 @@ func (j *Journal) RecordEvent(event *AuditEvent) error {
 
 	auditDir := filepath.Join(j.cfg.VaultDir, "audit")
 	if err := os.MkdirAll(auditDir, 0700); err != nil {
-		return err
+		return "", err
 	}
 
 	data, err := json.MarshalIndent(event, "", "  ")
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	eventFile := filepath.Join(auditDir, fmt.Sprintf("%s_%s.json", event.Timestamp.Format("20060102_150405"), event.EventID))
-	return fsutil.WriteFileAtomic(eventFile, data, 0600)
+	err = fsutil.WriteFileAtomic(eventFile, data, 0600)
+	if err != nil {
+		return "", err
+	}
+	return eventFile, nil
 }
 
 // ListEvents returns all historical audit events in chronological order.

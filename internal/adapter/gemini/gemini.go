@@ -285,8 +285,9 @@ func (g *GeminiAdapter) ImportV2(ctx context.Context, machineID string, opCtx *a
 		case string(model.KindMCPToolDef):
 			mcpTools, err := adapter.ParseMCPConfig(content)
 			if err == nil {
-				for idx, tool := range mcpTools {
-					toolID := fmt.Sprintf("%s_%d", adapter.GenerateStableEntityID("apmcp", g.Name(), logicalKey), idx)
+				for _, tool := range mcpTools {
+					serverKey := fmt.Sprintf("%s/server/%s", logicalKey, strings.ToLower(strings.TrimSpace(tool.Name)))
+					toolID := adapter.GenerateStableEntityID("apmcp", g.Name(), serverKey)
 					env := &model.EnvelopeV2{
 						ID:            toolID,
 						SchemaVersion: model.SchemaVersionV2,

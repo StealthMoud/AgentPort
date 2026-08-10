@@ -39,6 +39,16 @@ func (ps *ProposalStore) SaveProposal(prop *compiler.Proposal) error {
 	return fsutil.WriteFileAtomic(filePath, data, 0600)
 }
 
+// DeleteProposal removes a proposal from local vault proposal store.
+func (ps *ProposalStore) DeleteProposal(id string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	propDir := filepath.Join(ps.cfg.VaultDir, "proposals")
+	filePath := filepath.Join(propDir, id+".json")
+	return os.Remove(filePath)
+}
+
 // GetProposal retrieves a proposal by ID.
 func (ps *ProposalStore) GetProposal(id string) (*compiler.Proposal, bool) {
 	ps.mu.RLock()

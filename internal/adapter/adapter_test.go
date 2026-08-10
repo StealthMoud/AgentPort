@@ -373,3 +373,141 @@ func TestSkillScriptsNeverExecuted(t *testing.T) {
 		t.Fatalf("SECURITY VIOLATION: skill script was executed during parsing!")
 	}
 }
+
+func TestMCPLogicalIDsStableWhenSiblingAdded(t *testing.T) {
+	ctx := context.Background()
+	claudeDir := t.TempDir()
+
+	mcpConfigPath := filepath.Join(claudeDir, ".mcp.json")
+	initialConfig := `{
+		"mcpServers": {
+			"alpha": { "command": "node", "args": ["alpha.js"] },
+			"gamma": { "command": "node", "args": ["gamma.js"] }
+		}
+	}`
+	if err := os.WriteFile(mcpConfigPath, []byte(initialConfig), 0600); err != nil {
+		t.Fatalf("failed writing initial MCP config: %v", err)
+	}
+
+	cl := claude.New(claudeDir)
+	opCtx := &adapter.OperationContext{Scope: model.ScopeGlobal}
+
+	envs1, err := cl.ImportV2(ctx, "machine1", opCtx)
+	if err != nil {
+		t.Fatalf("ImportV2 failed: %v", err)
+	}
+
+	byName1 := make(map[string]*model.EnvelopeV2)
+	for _, env := range envs1 {
+		if env.Kind == model.KindMCPToolDef && env.MCPTool != nil {
+			byName1[env.MCPTool.Name] = env
+		}
+	}
+
+	alpha1, okAlpha1 := byName1["alpha"]
+	gamma1, okGamma1 := byName1["gamma"]
+	if !okAlpha1 || !okGamma1 {
+		t.Fatalf("expected alpha and gamma tools in initial import, got %d envelopes", len(envs1))
+	}
+
+	// Insert sibling "beta" between alpha and gamma
+	newConfig := `{
+		"mcpServers": {
+			"alpha": { "command": "node", "args": ["alpha.js"] },
+			"beta":  { "command": "node", "args": ["beta.js"] },
+			"gamma": { "command": "node", "args": ["gamma.js"] }
+		}
+	}`
+	if err := os.WriteFile(mcpConfigPath, []byte(newConfig), 0600); err != nil {
+		t.Fatalf("failed updating MCP config with sibling: %v", err)
+	}
+
+	envs2, err := cl.ImportV2(ctx, "machine1", opCtx)
+	if err != nil {
+		t.Fatalf("second ImportV2 failed: %v", err)
+	}
+
+	byName2 := make(map[string]*model.EnvelopeV2)
+	for _, env := range envs2 {
+		if env.Kind == model.KindMCPToolDef && env.MCPTool != nil {
+			byName2[env.MCPTool.Name] = env
+		}
+	}
+
+	alpha2, okAlpha2 := byName2["alpha"]
+	beta2, okBeta2 := byName2["beta"]
+	gamma2, okGamma2 := byName2["gamma"]
+	if !okAlpha2 || !okBeta2 || !okGamma2 {
+		t.Fatalf("expected alpha, beta, and gamma tools after sibling insertion")
+	}
+
+	if alpha1.ID != alpha2.ID {
+		t.Errorf("alpha ID changed after sibling insertion! before=%s after=%s", alpha1.ID, alpha2.ID)
+	}
+	if gamma1.ID != gamma2.ID {
+		t.Errorf("gamma ID changed after sibling insertion! before=%s after=%s", gamma1.ID, gamma2.ID)
+	}
+	if beta2.ID == alpha1.ID || beta2.ID == gamma1.ID {
+		t.Errorf("beta generated conflicting ID with existing server: %s", beta2.ID)
+	}
+}
+
+func TestMCPUpdateKeepsLogicalID(t *testing.T) {
+	ctx := context.Background()
+	claudeDir := t.TempDir()
+
+	mcpConfigPath := filepath.Join(claudeDir, ".mcp.json")
+	initialConfig := `{
+		"mcpServers": {
+			"gamma": { "command": "node", "args": ["gamma.js", "--verbose"] }
+		}
+	}`
+	_ = os.WriteFile(mcpConfigPath, []byte(initialConfig), 0600)
+
+	cl := claude.New(claudeDir)
+	opCtx := &adapter.OperationContext{Scope: model.ScopeGlobal}
+
+	envs1, err := cl.ImportV2(ctx, "machine1", opCtx)
+	if err != nil {
+		t.Fatalf("initial ImportV2 failed: %v", err)
+	}
+	var gamma1 *model.EnvelopeV2
+	for _, env := range envs1 {
+		if env.Kind == model.KindMCPToolDef {
+			gamma1 = env
+		}
+	}
+	if gamma1 == nil {
+		t.Fatalf("expected KindMCPToolDef envelope in initial import, got %d envelopes", len(envs1))
+	}
+	hash1 := gamma1.RevisionHash
+
+	// Update gamma's args
+	updatedConfig := `{
+		"mcpServers": {
+			"gamma": { "command": "node", "args": ["gamma.js", "--quiet"] }
+		}
+	}`
+	_ = os.WriteFile(mcpConfigPath, []byte(updatedConfig), 0600)
+
+	envs2, err := cl.ImportV2(ctx, "machine1", opCtx)
+	if err != nil {
+		t.Fatalf("second ImportV2 failed: %v", err)
+	}
+	var gamma2 *model.EnvelopeV2
+	for _, env := range envs2 {
+		if env.Kind == model.KindMCPToolDef {
+			gamma2 = env
+		}
+	}
+	if gamma2 == nil {
+		t.Fatalf("expected KindMCPToolDef envelope in second import, got %d envelopes", len(envs2))
+	}
+
+	if gamma1.ID != gamma2.ID {
+		t.Errorf("expected logical ID to remain identical across update! before=%s after=%s", gamma1.ID, gamma2.ID)
+	}
+	if hash1 == gamma2.RevisionHash {
+		t.Errorf("expected RevisionHash to change when MCP args update")
+	}
+}
